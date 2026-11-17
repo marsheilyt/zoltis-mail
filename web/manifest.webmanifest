@@ -1,0 +1,9 @@
+{
+  "name": "Zoltis Mail",
+  "short_name": "Zoltis Mail",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f6f8fc",
+  "theme_color": "#2f6bff",
+  "icons": [{ "src": "/img/logo.svg", "sizes": "any", "type": "image/svg+xml" }]
+}

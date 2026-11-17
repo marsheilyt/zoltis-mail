@@ -1,0 +1,29 @@
+# Publishes images to GitHub Container Registry when you push a tag like v1.2.0
+name: Release images
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+  packages: write
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { name: web, context: ., file: docker/web/Dockerfile }
+          - { name: postfix, context: docker/postfix, file: docker/postfix/Dockerfile }
+          - { name: dovecot, context: docker/dovecot, file: docker/dovecot/Dockerfile }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/zoltis-mail-${{ matrix.name }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository_owner }}/zoltis-mail-${{ matrix.name }}:latest

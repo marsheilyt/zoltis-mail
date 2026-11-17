@@ -1,0 +1,125 @@
+# Zoltis Mail - Community Edition
+# Quick start:  ./install.sh      (or: cp .env.example .env && edit && docker compose up -d --build)
+name: zoltis-mail
+
+x-restart: &restart
+  restart: unless-stopped
+  # Cap container logs (3 x 10 MB each) so they can't fill a small VPS disk.
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  web:
+    <<: *restart
+    build: { context: ., dockerfile: docker/web/Dockerfile }
+    image: zoltis-mail/web:${ZOLTIS_VERSION:-latest}
+    environment:
+      ZOLTIS_SERVER_BEHIND_HTTPS: "true"
+      ZOLTIS_SERVER_TRUST_PROXY: "true"
+      ZOLTIS_IMAP_HOST: dovecot
+      ZOLTIS_IMAP_PORT: "143"
+      ZOLTIS_IMAP_SECURITY: plain
+      ZOLTIS_SMTP_HOST: postfix
+      ZOLTIS_SMTP_PORT: "10587"
+      ZOLTIS_SMTP_SECURITY: plain
+      ZOLTIS_MAIL_SERVER_MODE: bundled
+      ZOLTIS_MAIL_SERVER_CONF_DIR: /var/lib/zoltis/mailconf
+      ZOLTIS_MAIL_SERVER_IMAP_HOST: dovecot
+      ZOLTIS_MAIL_SERVER_SMTP_HOST: postfix
+      ZOLTIS_MAIL_SERVER_HOSTNAME: ${MAIL_HOST:?set MAIL_HOST in .env}
+      ZOLTIS_MAIL_SERVER_WEB_HOSTNAME: ${WEB_HOST:?set WEB_HOST in .env}
+      ZOLTIS_MAIL_SERVER_PUBLIC_IP: ${PUBLIC_IP:-}
+      ZOLTIS_MAIL_SERVER_MASTER_ALLOW_NETS: 172.28.0.10/32
+      ZOLTIS_BRANDING_APP_NAME: ${APP_NAME:-Zoltis Mail}
+      ZOLTIS_SETUP_TOKEN: ${SETUP_TOKEN:-}
+      ZOLTIS_LICENSE_KEY: ${LICENSE_KEY:-}
+      ZOLTIS_ANTIVIRUS_ENABLED: ${ANTIVIRUS:-true}
+      ZOLTIS_ANTIVIRUS_SOCKET: "-"
+      ZOLTIS_ANTIVIRUS_HOST: clamav
+      ZOLTIS_ANTIVIRUS_PORT: "3310"
+      TZ: ${TZ:-UTC}
+    volumes:
+      - zoltis-data:/var/lib/zoltis
+      - mailconf:/var/lib/zoltis/mailconf
+      - ./config:/etc/zoltis:ro          # optional zoltis.ini for advanced settings
+    networks:
+      zoltis: { ipv4_address: 172.28.0.10 }
+
+  dovecot:
+    <<: *restart
+    build: docker/dovecot
+    image: zoltis-mail/dovecot:${ZOLTIS_VERSION:-latest}
+    environment:
+      MAIL_HOST: ${MAIL_HOST}
+      WEB_IP: 172.28.0.10
+      TZ: ${TZ:-UTC}
+    ports:
+      - "993:993"        # IMAP over TLS for phones / Outlook / Thunderbird
+    volumes:
+      - vmail:/var/vmail
+      - mailconf:/zoltis-conf
+      - caddy-data:/caddy:ro
+    networks: [zoltis]
+    depends_on: [web]
+
+  postfix:
+    <<: *restart
+    build: docker/postfix
+    image: zoltis-mail/postfix:${ZOLTIS_VERSION:-latest}
+    environment:
+      MAIL_HOST: ${MAIL_HOST}
+      # Max parallel Postfix processes. 100 is Postfix's default; use 20 on 1-2 GB servers
+      # so a burst of spam connections can't exhaust the RAM.
+      POSTFIX_PROCESS_LIMIT: ${POSTFIX_PROCESS_LIMIT:-100}
+      TZ: ${TZ:-UTC}
+    ports:
+      - "25:25"          # incoming mail from the internet
+      - "465:465"        # sending from mail apps (implicit TLS)
+      - "587:587"        # sending from mail apps (STARTTLS)
+    volumes:
+      - postfix-spool:/var/spool/postfix
+      - mailconf:/zoltis-conf
+      - caddy-data:/caddy:ro
+    networks: [zoltis]
+    depends_on: [dovecot]
+
+  clamav:
+    <<: *restart
+    image: clamav/clamav:stable
+    profiles: ["antivirus"]
+    volumes:
+      - clamav-db:/var/lib/clamav
+    networks: [zoltis]
+
+  caddy:
+    <<: *restart
+    image: caddy:2
+    environment:
+      WEB_HOST: ${WEB_HOST:?set WEB_HOST in .env}
+      MAIL_HOST: ${MAIL_HOST}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [zoltis]
+    depends_on: [web]
+
+networks:
+  zoltis:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  zoltis-data:
+  mailconf:
+  vmail:
+  postfix-spool:
+  clamav-db:
+  caddy-data:
+  caddy-config:

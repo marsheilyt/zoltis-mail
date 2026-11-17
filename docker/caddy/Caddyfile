@@ -1,0 +1,15 @@
+# Automatic HTTPS (Let's Encrypt) for the webmail and the mail server hostname.
+{
+	email {$ACME_EMAIL}
+}
+
+{$WEB_HOST} {
+	encode zstd gzip
+	reverse_proxy web:8080
+	header -Server
+}
+
+# Only here so Caddy obtains a certificate that Postfix and Dovecot reuse.
+{$MAIL_HOST} {
+	respond "Zoltis Mail server" 200
+}
