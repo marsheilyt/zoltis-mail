@@ -54,6 +54,8 @@ DEFAULTS = {
     },
     "license": {
         "edition": "community",
+        # Community Edition license enforcement. false = no key needed (licensing turned off).
+        "required": "false",
         # Enterprise Edition license file.
         "key_file": "/etc/zoltis/license.key",
         # Community Edition: licensing portal that activates keys (blank = built-in default).

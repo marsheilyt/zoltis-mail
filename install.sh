@@ -125,9 +125,6 @@ if [[ ! -f .env ]]; then
     warn "This server has ${MEM} MB RAM. ClamAV antivirus needs about 1.5 GB."
     yes_no "Enable antivirus anyway?" || { AV=false; PROF=; }
   fi
-  echo "Community Edition needs a free license key before it can create email accounts."
-  echo "Register your mail domain on the Zoltis licensing portal to get one."
-  LIC=$(ask "License key (or leave empty and enter it on the setup screen)" "")
   TOKEN=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | cut -c1-8 | tr a-f A-F)
   cat > .env <<EOF
 WEB_HOST=$WEB
@@ -139,7 +136,8 @@ ANTIVIRUS=$AV
 COMPOSE_PROFILES=$PROF
 POSTFIX_PROCESS_LIMIT=$PLIMIT
 SETUP_TOKEN=$TOKEN
-LICENSE_KEY=$LIC
+LICENSE_REQUIRED=false
+LICENSE_KEY=
 TZ=$(cat /etc/timezone 2>/dev/null || echo UTC)
 EOF
   chmod 600 .env
@@ -210,7 +208,6 @@ echo "${g}${b}Zoltis Mail is running.${n}"
 echo "  Open:          https://${WEB_HOST}"
 if [[ -n "$CODE" && "$CODE" != Setup* ]]; then
   echo "  Setup code:    ${b}${CODE}${n}   (create your admin account on the first screen)"
-  [[ -z "${LICENSE_KEY:-}" ]] && echo "  License key:   enter it on the setup screen (free: register on the Zoltis licensing portal)"
 fi
 echo "  Then:          Admin console -> ${b}Setup guide${n}: every DNS record (MX, SPF, DKIM, DMARC) ready to copy into"
 echo "                 Cloudflare, plus reverse DNS, port 25 and mail app settings."

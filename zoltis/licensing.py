@@ -263,6 +263,13 @@ class LicenseManager:
         return (self.cfg.get("license", "server") or DEFAULT_SERVER).rstrip("/")
 
     @property
+    def enabled(self) -> bool:
+        """False (the default for now) turns license enforcement off: no key is needed, nothing
+        is sent to the licensing portal, and accounts/domains can be created freely.
+        Turn it on with [license] required = true or ZOLTIS_LICENSE_REQUIRED=true."""
+        return self.cfg.getbool("license", "required")
+
+    @property
     def register_url(self) -> str:
         return self.cfg.get("license", "register_url") or DEFAULT_REGISTER_URL
 
@@ -353,6 +360,8 @@ class LicenseManager:
         return bool(self.cert) and (now or time.time()) < float(self.cert.get("valid_until") or 0)
 
     def state(self) -> str:
+        if not self.enabled:
+            return "disabled"
         self._reload_if_changed()
         if not self.key:
             return "missing"
@@ -367,7 +376,7 @@ class LicenseManager:
 
     @property
     def active(self) -> bool:
-        return self.state() == "active"
+        return self.state() in ("active", "disabled")
 
     @property
     def domains(self) -> list[str]:
@@ -378,6 +387,8 @@ class LicenseManager:
 
     def require(self, domain: str | None = None):
         """Raise LicenseRequired unless new accounts/domains may be created (for `domain`)."""
+        if not self.enabled:
+            return
         st = self.state()
         if st != "active":
             msg = {
@@ -398,7 +409,7 @@ class LicenseManager:
 
     def public(self, full: bool = False) -> dict:
         st = self.state()
-        out = {"state": st, "active": self.active, "domains": self.domains, "register_url": self.register_url,
+        out = {"state": st, "active": self.active, "required": self.enabled, "domains": self.domains, "register_url": self.register_url,
                "upgrade_url": self.upgrade_url}
         if full:
             info = self.info or {}
@@ -496,7 +507,7 @@ class LicenseManager:
     # -- background renewal ---------------------------------------------
     def start(self):
         """Activate a key given in ZOLTIS_LICENSE_KEY and keep the activation renewed."""
-        if self._thread:
+        if self._thread or not self.enabled:
             return
         self._thread = threading.Thread(target=self._loop, name="license", daemon=True)
         self._thread.start()

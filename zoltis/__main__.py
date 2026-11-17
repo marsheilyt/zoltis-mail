@@ -106,6 +106,9 @@ def main(argv=None):
         from .licensing import LicenseError
         app = App(cfg)
         lic = app.license
+        if not lic.enabled:
+            print("Licensing is turned off ([license] required = false). No key is needed.")
+            sys.exit(0)
         try:
             if args.action == "activate":
                 key = args.key or input("Paste your license key: ")

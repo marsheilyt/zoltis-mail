@@ -92,6 +92,8 @@ default_domain =
 allowed_domains =
 
 [license]
+# Licensing is turned off by default (no key needed). Set to true to require a key.
+# required = false
 # Community Edition: every install needs a (free) license key before it can create
 # email accounts. Enter it on the setup screen, in Admin console > License, with
 # `zoltis license activate <KEY>`, or set ZOLTIS_LICENSE_KEY. It is activated online

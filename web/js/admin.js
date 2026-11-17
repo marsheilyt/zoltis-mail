@@ -473,7 +473,7 @@ async function upgrade(body) {
 
 // ------------------------------------------------------------------ license
 const LIC_STATE = {
-  active: ["ok", "Active"], missing: ["off", "No license key"],
+  active: ["ok", "Active"], disabled: ["ok", "Not required"], missing: ["off", "No license key"],
   invalid: ["off", "Invalid key"], expired: ["off", "Expired"], inactive: ["warn", "Not activated"], lapsed: ["warn", "Activation lapsed"],
 };
 function licenseNote(lic) {
@@ -485,6 +485,11 @@ function licenseNote(lic) {
 async function license(body, ctx) {
   const L = await api("/api/admin/license");
   if (state.overview) state.overview.license = L;
+  if (!L.required) {
+    body.innerHTML = `<div class="limit-note">${icon("check")}<span><b>No license key needed.</b>
+      Licensing is turned off on this server, so you can create accounts and add domains without a key.</span></div>`;
+    return;
+  }
   const [cls, label] = LIC_STATE[L.state] || ["", L.state];
   const day = (t) => (t ? new Date(t * 1000).toLocaleDateString() : "–");
   body.innerHTML = `<table class="tbl" style="max-width:760px">

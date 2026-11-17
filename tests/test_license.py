@@ -198,3 +198,18 @@ def test_external_mode_new_sign_ins_need_license(portal):
     assert db.ensure_seat("bob@acme.com")["is_admin"]
     with pytest.raises(NotLicensed):
         db.ensure_seat("eve@other.com")
+
+
+def test_licensing_off_by_default_allows_everything(monkeypatch):
+    monkeypatch.delenv("ZOLTIS_LICENSE_REQUIRED", raising=False)
+    d = tempfile.mkdtemp()
+    m = manager(d)
+    assert not m.enabled
+    assert m.state() == "disabled" and m.active
+    assert m.public()["required"] is False
+    m.start()  # must not start the portal renewal thread
+    assert m._thread is None
+    db = AccountDB(os.path.join(d, "a.db"), {"max_accounts": 10, "max_quota_mb": 720}, "bundled", m)
+    db.add_domain("acme.com")
+    db.add_domain("other.com")
+    db.create_account("ann@other.com", "Ann-pass-123")

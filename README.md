@@ -63,11 +63,8 @@ sudo ./install.sh
 The installer asks for your webmail address (e.g. `webmail.yourcompany.com`) and mail server name
 (`mail.yourcompany.com`), writes `.env`, builds the containers and starts them. It prints a **setup code**.
 
-0. **Get a free license key**: register on the Zoltis licensing portal with the mail domain(s) you'll use.
-   Community Edition is free, but it won't create email accounts until a license key is activated.
-   The key only works for the domains you registered. See [docs/LICENSING.md](docs/LICENSING.md).
 1. Point two DNS **A records** at the server: `webmail.yourcompany.com` and `mail.yourcompany.com`.
-2. Open `https://webmail.yourcompany.com`, enter the setup code and your license key, and create your administrator account.
+2. Open `https://webmail.yourcompany.com`, enter the setup code, and create your administrator account.
 3. Open **Admin console → Setup guide**. It lists every record (MX, SPF, DKIM, DMARC) exactly as Cloudflare's
    *Add record* form asks for it (Name, Content, Priority, Proxy status), plus reverse DNS (PTR), port 25 and
    mail app settings. Add them in Cloudflare, wait 5–30 minutes, then click **Check DNS**.

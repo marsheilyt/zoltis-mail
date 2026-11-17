@@ -578,7 +578,7 @@ class App:
         email = (b.get("email") or "").strip().lower()
         domain = email.split("@")[-1] if "@" in email else ""
         key = "".join(str(b.get("license_key") or "").split())
-        if key or not self.license.active:
+        if self.license.enabled and (key or not self.license.active):
             if not key:
                 raise HTTPError(400, f"Enter your license key. Register for a free key at {self.license.register_url}")
             try:

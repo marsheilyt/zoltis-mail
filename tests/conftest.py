@@ -14,6 +14,9 @@ from zoltis import licensing  # noqa: E402
 
 TEST_KID = "test"
 
+# The licensing tests exercise enforcement, which is off by default.
+os.environ.setdefault("ZOLTIS_LICENSE_REQUIRED", "true")
+
 
 @pytest.fixture(scope="session")
 def portal():
