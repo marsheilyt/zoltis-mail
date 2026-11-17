@@ -213,3 +213,17 @@ def test_licensing_off_by_default_allows_everything(monkeypatch):
     db.add_domain("acme.com")
     db.add_domain("other.com")
     db.create_account("ann@other.com", "Ann-pass-123")
+
+
+def test_community_allows_two_domains(monkeypatch):
+    from zoltis.accounts import LimitReached
+    from zoltis.edition import COMMUNITY_LIMITS
+    monkeypatch.delenv("ZOLTIS_LICENSE_REQUIRED", raising=False)
+    d = tempfile.mkdtemp()
+    db = AccountDB(os.path.join(d, "a.db"), dict(COMMUNITY_LIMITS), "bundled", manager(d))
+    db.add_domain("one.com")
+    db.add_domain("two.com")
+    with pytest.raises(LimitReached):
+        db.add_domain("three.com")
+    db.delete_domain("two.com")
+    db.add_domain("three.com")  # freed slot can be reused

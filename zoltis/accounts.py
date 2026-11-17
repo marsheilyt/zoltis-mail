@@ -147,6 +147,10 @@ class AccountDB:
     def max_aliases(self):
         return self.limits.get("max_aliases")
 
+    @property
+    def max_domains(self):
+        return self.limits.get("max_domains")
+
     @staticmethod
     def _counts_as_alias(source: str) -> bool:
         return not source.startswith("postmaster@")
@@ -175,6 +179,9 @@ class AccountDB:
         if self.domain(name):
             raise AccountError(f"Domain {name} already exists")
         self._require_license(name)
+        if self.max_domains and len(self.domains()) >= self.max_domains:
+            raise LimitReached(f"Community Edition allows up to {self.max_domains} domains. "
+                               "Delete a domain you no longer use, or upgrade to Zoltis Mail Pro for more")
         self._x("INSERT INTO domains(name, created) VALUES (?, ?)", (name, int(time.time())))
         self.audit(actor, "domain.add", name)
         return self.domain(name)

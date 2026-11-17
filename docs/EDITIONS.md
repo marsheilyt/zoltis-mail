@@ -3,8 +3,9 @@
 | | **Community Edition** |
 |---|---|
 | Who runs the server | **You**, on your own Ubuntu/Linux server (Docker) |
-| Price | Free (download from GitHub, free license key) |
+| Price | Free (download from GitHub) |
 | Email accounts | Up to **10** |
+| Domains | Up to **2** |
 | Aliases | Up to **5** (`postmaster@` is free) |
 | Mailbox size | Up to **720 MB** per account, attachments included |
 | Support | Community (GitHub issues) |

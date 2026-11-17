@@ -29,7 +29,7 @@ COMMUNITY_FEATURES = [
 ]
 # Community Edition limits (Enterprise limits come from the license).
 # postmaster@<domain> aliases don't count towards max_aliases (every domain needs one for DMARC reports).
-COMMUNITY_LIMITS = {"max_accounts": 10, "max_aliases": 5, "max_quota_mb": 720, "drive": False}
+COMMUNITY_LIMITS = {"max_accounts": 10, "max_aliases": 5, "max_domains": 2, "max_quota_mb": 720, "drive": False}
 ENTERPRISE_FEATURES = [
     "calendar", "drive", "contacts", "carddav", "caldav", "mobile_api",
     "sso", "shared_mailboxes", "audit_log", "group_policies", "multi_server",
@@ -60,6 +60,7 @@ class Edition:
         self.license = info
         self.name = "enterprise"
         self.limits = {"max_accounts": int(info.get("seats") or 0) or None,
+                       "max_domains": int(info.get("max_domains") or 0) or None,
                        "max_quota_mb": int(info.get("max_quota_mb") or 0) or None, "drive": True}
         self.modules = enterprise.load(info)
         for m in self.modules:

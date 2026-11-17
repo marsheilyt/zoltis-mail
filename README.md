@@ -14,6 +14,7 @@ on your own Ubuntu or Linux server.
 | Community Edition limits | |
 |---|---|
 | Email accounts | **up to 10** |
+| Domains | **up to 2** (accounts and aliases are shared across them) |
 | Aliases (info@, sales@ …) | **up to 5** (`postmaster@` doesn't count) |
 | Mailbox size | **up to 720 MB per account**, including attachments |
 | Drive / file storage | not included |

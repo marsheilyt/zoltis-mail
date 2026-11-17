@@ -745,7 +745,8 @@ class App:
             out.append(d)
         return {"domains": out, "mail_hostname": getattr(self.mailserver, "hostname", None),
                 "web_hostname": getattr(self.mailserver, "web_hostname", None) or None,
-                "public_ip": self.public_ip or None, "mode": self.mode}
+                "public_ip": self.public_ip or None, "mode": self.mode,
+                "max_domains": self.edition.limits.get("max_domains")}
 
     def adm_domain_add(self, req, s):
         name = (req.json().get("name") or "").strip().lower()

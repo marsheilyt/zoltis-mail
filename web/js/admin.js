@@ -57,7 +57,7 @@ async function overview(body, ctx) {
         ${max ? meter(pct) : ""}<div class="sub">${max ? `${max - o.accounts} remaining in this edition` : "Unlimited"}</div></div>
       <div class="card"><h4>${icon("cloud")} Storage allocated</h4><div class="big">${mb(o.allocated_mb)}</div>
         <div class="sub">Up to ${o.limits.max_quota_mb ? mb(o.limits.max_quota_mb) : "custom"} per mailbox, attachments included</div></div>
-      <div class="card"><h4>${icon("label")} Domains · aliases</h4><div class="big">${o.domains}<small> · ${o.aliases_counted}${o.limits.max_aliases ? ` / ${o.limits.max_aliases}` : ""} aliases</small></div>
+      <div class="card"><h4>${icon("label")} Domains · aliases</h4><div class="big">${o.domains}${o.limits.max_domains ? `<small> / ${o.limits.max_domains}</small>` : ""}<small> · ${o.aliases_counted}${o.limits.max_aliases ? ` / ${o.limits.max_aliases}` : ""} aliases</small></div>
         <div class="sub">${o.admins} administrator${o.admins === 1 ? "" : "s"}${o.disabled ? ` · ${o.disabled} disabled account${o.disabled > 1 ? "s" : ""}` : ""}</div></div>
       <div class="card"><h4>${icon("lock")} Signed in now</h4><div class="big">${o.sessions}</div><div class="sub"><a href="#/admin/sessions">View sessions</a></div></div>
     </div>
@@ -72,7 +72,7 @@ async function overview(body, ctx) {
       <tr><td>Antivirus (ClamAV)</td><td>${!o.antivirus.enabled ? `<span class="badge">Disabled</span>` : ok(o.antivirus.online)}</td></tr>
       <tr><td>Attachment blocker</td><td>${o.attachment_policy.enabled ? `<span class="badge ok">${icon("shield")} Active</span>` : `<span class="badge">Disabled</span>`}</td></tr>
     </table>
-    ${upgradeNote(`<b>Community Edition</b> includes up to ${max} accounts and ${o.limits.max_aliases} aliases, with ${o.limits.max_quota_mb} MB per mailbox.`)}`;
+    ${upgradeNote(`<b>Community Edition</b> includes up to ${max} accounts, ${o.limits.max_domains} domains and ${o.limits.max_aliases} aliases, with ${o.limits.max_quota_mb} MB per mailbox.`)}`;
 }
 
 // ------------------------------------------------------------------ accounts
@@ -187,8 +187,9 @@ function deleteAccount(a, ctx) {
 async function domains(body, ctx) {
   const r = await api("/api/admin/domains");
   state.domains = r.domains;
-  body.innerHTML = `<div class="adm-tools"><button class="btn primary" id="dom-new">${icon("add")} Add domain</button>
-    <span class="count">Mail server hostname: <b>${esc(r.mail_hostname || "")}</b></span></div>
+  const dmax = r.max_domains, dfull = dmax && r.domains.length >= dmax;
+  body.innerHTML = `<div class="adm-tools"><button class="btn primary" id="dom-new" ${dfull ? "disabled" : ""} title="${dfull ? `Limit of ${dmax} domains reached` : ""}">${icon("add")} Add domain</button>
+    <span class="count"><b>${r.domains.length}</b> of ${dmax || "∞"} domains${dfull ? ` · <span class="st-warn">limit reached</span> · <a href="#/admin/upgrade">Upgrade to Mail Pro</a>` : ""} · Mail server hostname: <b>${esc(r.mail_hostname || "")}</b></span></div>
     <div class="limit-note">${icon("help")}<span>Publish these records at your DNS provider. They make mail reach you (MX) and keep your messages out of spam (SPF, DKIM, DMARC). Ask your server provider to set the reverse DNS (PTR) of the server's IP to <b>${esc(r.mail_hostname || "")}</b>.
       Using Cloudflare? The <a href="#/admin/guide">setup guide</a> shows each record exactly as Cloudflare asks for it. A records must be <b>DNS only</b> (grey cloud).</span></div>
     <div id="dom-list"></div>`;
@@ -459,8 +460,8 @@ async function upgrade(body) {
   const lim = o.limits || {};
   body.innerHTML = `<div style="max-width:760px">
     <h3 style="font:500 20px var(--font);margin:0 0 8px">${icon("star")} Upgrade to Zoltis Mail Pro</h3>
-    <p style="margin:0 0 12px">This server runs the free Community Edition: <b>${o.accounts} of ${lim.max_accounts}</b> accounts and
-      <b>${o.aliases_counted} of ${lim.max_aliases}</b> aliases used, up to ${lim.max_quota_mb} MB per mailbox.</p>
+    <p style="margin:0 0 12px">This server runs the free Community Edition: <b>${o.accounts} of ${lim.max_accounts}</b> accounts,
+      <b>${o.aliases_counted} of ${lim.max_aliases}</b> aliases and <b>${o.domains} of ${lim.max_domains}</b> domains used, up to ${lim.max_quota_mb} MB per mailbox.</p>
     <p style="margin:0 0 12px">Zoltis also offers paid plans with more accounts and aliases, where Zoltis runs, monitors, updates and backs up
       the mail server for you. See the plans and sign up on the Zoltis website.</p>
     <a class="btn primary" href="${esc(L.upgrade_url)}" target="_blank" rel="noopener">${icon("star")} See plans and sign up</a>
