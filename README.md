@@ -118,6 +118,19 @@ docker compose exec web zoltis doctor yourcompany.com   # deliverability / spam 
 ./scripts/backup.sh                                 # encrypted backup (asks for a passphrase) to ./backups
 ```
 
+## Encrypting stored mail (optional)
+
+`sudo ./scripts/encrypt-storage.sh` moves the mailboxes, mail queue, accounts and DKIM keys into a LUKS2
+(AES-256) encrypted container on the server. It protects against a stolen disk, a provider snapshot, or a
+server that is decommissioned without being wiped. It does not protect against someone who gets into the
+running server. Everything (webmail, mail apps, app passwords, export, backups) keeps working as before.
+
+- **After every reboot** mail stays offline until you run `sudo ./scripts/unlock.sh` and type the passphrase.
+  Other servers keep retrying for about 5 days, so incoming mail is delayed, not lost.
+- `sudo ./scripts/lock.sh` stops mail and locks the data; `sudo ./scripts/encrypt-storage.sh --grow 5` adds 5 GB.
+- **If you lose the passphrase, the mail is gone.** Keep it in a password manager, add a second one with
+  `sudo cryptsetup luksAddKey /var/lib/zoltis-vault.img`, and keep encrypted backups off the server.
+
 ## Moving from your current server (Postfix + Dovecot + Roundcube)
 
 1. Install Zoltis Mail on a **new** server (or stop the old services first, because ports 25/587/993 must be free).
@@ -184,11 +197,12 @@ It is enabled automatically on servers with 4 GB of RAM or more and stays off on
 - The admin console uses an internal Dovecot master login (random 256-bit secret) that only the web container's private IP may use.
 - Encryption in transit everywhere: HTTPS with HSTS (2 years); TLS 1.2+ with forward-secrecy ciphers on IMAP and SMTP;
   STARTTLS even between containers on the private network.
-- Outgoing mail is verified with DANE (DNSSEC, via a local validating resolver) and MTA-STS where the receiving domain
-  publishes them, opportunistic TLS otherwise. Each domain publishes its own MTA-STS policy and TLS reporting record
+- Outgoing mail uses opportunistic TLS: encrypted whenever the receiving server supports it. TLS is not
+  required, because some hosts (e.g. Namecheap VPS) pass outgoing port 25 through a filter without STARTTLS.
+  Each domain publishes its own MTA-STS policy and TLS reporting record for *incoming* mail
   (*Domains & DNS*: start in `testing`, switch to `enforce` once the reports are clean).
-- Backups made with `scripts/backup.sh` are encrypted with your passphrase (AES-256). Stored mailboxes are not
-  encrypted per user; protect the server disk with your provider's disk encryption.
+- Backups made with `scripts/backup.sh` are encrypted with your passphrase (AES-256). Stored mail can be encrypted
+  at rest with `sudo ./scripts/encrypt-storage.sh` (see *Encrypting stored mail*).
 - Code integrity: every release is signed (`zoltis/RELEASE.manifest`). Changed program files, including the logo,
   lock the service and are reported at the daily license check-in (see `docs/LICENSING.md`).
 - Community Edition policies (`web/legal/community-policies-v1.0.md`): the first administrator must accept them on

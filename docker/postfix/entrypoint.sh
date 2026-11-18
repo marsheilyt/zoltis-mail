@@ -98,40 +98,13 @@ configure() {
 }
 
 # ------------------------------------------------------------------ outgoing encryption policy
-# DANE: verify receiving servers through DNSSEC-signed TLSA records (needs a validating resolver).
-# MTA-STS: enforce TLS + certificate checks for domains that publish a policy (Gmail, Outlook, ...).
-# Everything else: opportunistic TLS. Each layer falls back safely if its helper isn't running.
-start_unbound() {
-  unbound-anchor -a /var/lib/unbound/root.key >/dev/null 2>&1 || true
-  chown unbound:unbound /var/lib/unbound/root.key 2>/dev/null || true
-  unbound -d -c /etc/unbound/zoltis.conf &
-  UB_PID=$!
-}
-start_sts() { mta-sts-daemon -c /etc/mta-sts-daemon.yml >/dev/null 2>&1 & STS_PID=$!; }
+# Opportunistic TLS only (same as 2.2): encrypt when the receiving server supports it, otherwise
+# send anyway. DANE/MTA-STS enforcement (added in 2.3) is disabled: hosting providers such as
+# Namecheap pass outgoing port 25 through a filter without STARTTLS, and enforcement then
+# deferred all mail to Gmail, Outlook, Yahoo, etc. ("TLS is required, but was not offered").
 outbound_policy() {
-  local dane=no sts=no
-  [[ -f /etc/resolv.conf.docker ]] || cp /etc/resolv.conf /etc/resolv.conf.docker
-  start_unbound
-  for i in $(seq 1 15); do
-    if dig +short +time=2 @127.0.0.1 dovecot A >/dev/null 2>&1 && \
-       dig +dnssec +time=3 @127.0.0.1 isc.org SOA 2>/dev/null | grep -q " ad[ ;]"; then dane=yes; break; fi
-    sleep 1
-  done
-  if [[ $dane == yes ]]; then
-    printf 'nameserver 127.0.0.1\noptions edns0 trust-ad\n' > /etc/resolv.conf
-    postconf -e "smtp_dns_support_level = dnssec" "smtp_tls_security_level = dane"
-  else
-    cp /etc/resolv.conf.docker /etc/resolv.conf
-    postconf -e "smtp_dns_support_level = enabled" "smtp_tls_security_level = may"
-  fi
-  start_sts
-  for i in $(seq 1 10); do nc -z 127.0.0.1 8461 2>/dev/null && { sts=yes; break; }; sleep 1; done
-  if [[ $sts == yes ]]; then
-    postconf -e "smtp_tls_policy_maps = socketmap:inet:127.0.0.1:8461:postfix"
-  else
-    postconf -e "smtp_tls_policy_maps ="
-  fi
-  log "outgoing encryption: DANE=${dane} MTA-STS=${sts} (otherwise opportunistic TLS)"
+  postconf -e "smtp_dns_support_level = enabled" "smtp_tls_security_level = may" "smtp_tls_policy_maps ="
+  log "outgoing encryption: opportunistic TLS (DANE/MTA-STS enforcement off)"
 }
 
 # ------------------------------------------------------------------ sync from web container
@@ -173,7 +146,9 @@ start_opendkim
 postfix check || true
 postfix start-fg &
 PF_PID=$!
-trap 'postfix stop; kill $DKIM_PID ${UB_PID:-} ${STS_PID:-} 2>/dev/null; exit 0' TERM INT
+# Retry mail that 2.3 deferred under the old TLS enforcement.
+( sleep 15; postqueue -f >/dev/null 2>&1 || true ) &
+trap 'postfix stop; kill $DKIM_PID 2>/dev/null; exit 0' TERM INT
 
 TICK=0
 while kill -0 "$PF_PID" 2>/dev/null; do
@@ -188,9 +163,4 @@ while kill -0 "$PF_PID" 2>/dev/null; do
     if install_cert; then postfix reload || true; fi
   fi
   kill -0 "$DKIM_PID" 2>/dev/null || start_opendkim
-  if [[ -n "${STS_PID:-}" ]] && ! kill -0 "$STS_PID" 2>/dev/null; then log "restarting MTA-STS resolver"; start_sts; fi
-  if [[ -n "${UB_PID:-}" ]] && ! kill -0 "$UB_PID" 2>/dev/null; then
-    log "DNS resolver stopped: falling back to opportunistic TLS"; cp /etc/resolv.conf.docker /etc/resolv.conf
-    postconf -e "smtp_dns_support_level = enabled" "smtp_tls_security_level = may"; postfix reload || true; UB_PID=""
-  fi
 done
