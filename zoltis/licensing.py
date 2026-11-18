@@ -580,7 +580,7 @@ class LicenseManager:
                 err = json.loads(e.read() or b"{}")
             except ValueError:
                 err = {}
-            if 400 <= e.code < 500:
+            if 400 <= e.code < 500 and e.code not in (408, 429):   # 408/429 = try again later, not a refusal
                 raise LicenseError(err.get("error") or f"zoltismail.com refused the key (HTTP {e.code})")
             raise ConnectionError(f"zoltismail.com licensing error HTTP {e.code}")
         except (urllib.error.URLError, OSError, ValueError) as e:

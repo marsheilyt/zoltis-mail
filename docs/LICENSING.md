@@ -76,9 +76,9 @@ all of `web/`, including the logos), signed by Zoltis. The server checks its fil
 | `modified` | A core file was changed, added or deleted (for example a replaced logo) | **Locked**: webmail, IMAP and SMTP refuse every sign-in with "program files were changed"; incoming mail is still stored |
 | `unsigned` | No manifest, a forged one, or one for another version | **Locked** the same way |
 
-Enforcement (`[integrity] enforce`, env `ZOLTIS_INTEGRITY_ENFORCE`): `auto` (default) is on when licensing is
-required or when the copy carries a genuine signed manifest, so every official build enforces it and development
-checkouts don't. Putting the official files back (reinstall or `git checkout`) unlocks the server at the next check.
+Enforcement (`[integrity] enforce`, env `ZOLTIS_INTEGRITY_ENFORCE`): `auto` (default) is on when the copy carries a
+genuine signed manifest, or when licensing is required and the build trusts a Zoltis release key (`TRUSTED_KEYS`).
+Until the first signed release ships with that key, unsigned builds only report their status and never lock. Putting the official files back (reinstall or `git checkout`) unlocks the server at the next check.
 The status is reported at every check-in (see `integrity` above), so ZOcc sees modified installs per license ID and
 can refuse to renew them (answer `4xx` with `code: "modified"`), or suspend a managed plan.
 
@@ -154,7 +154,7 @@ In that case a refused key never blocks anything; the portal just stops seeing t
 |---|---|
 | `200 {"activation": "ZM1.…"}` | Activated or renewed. Certificate stored. |
 | `4xx {"error": "message shown to the admin", "code": "revoked\|expired\|in_use\|invalid"}` | Refused. The app drops its activation and stops creating accounts. |
-| `5xx` / timeout | Temporary. The app keeps the current activation and retries in 15 min. |
+| `408`, `429`, `5xx` / timeout | Temporary. The app keeps the current activation and retries in 15 min. |
 
 Recommended policy (what `devtools/license_dev.py serve` does): verify the key signature, reject revoked or expired
 keys, and allow **one active `install_id` per `lid`**. The same install re-activating is always fine. A different

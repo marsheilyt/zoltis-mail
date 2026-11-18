@@ -202,7 +202,7 @@ It is enabled automatically on servers with 4 GB of RAM or more and stays off on
 
 ```bash
 python3 devtools/demo.py        # full demo without Docker (emulated mail server), setup code DEMO1234
-python3 -m pytest -q tests      # 141 tests
+python3 -m pytest -q tests      # 142 tests
 ```
 
 Project layout:

@@ -388,3 +388,15 @@ def test_admin_reminders_sent_once_at_each_step(monkeypatch):
         f.write(str(int(time.time() - 8 * 86400)))
     App.license = manager(d)
     assert reminders.run(App) == "reg-over" and len(got) == 4
+
+
+def test_rate_limited_check_in_keeps_the_license(portal, monkeypatch):
+    """A 429 from zoltismail.com means "try later": the server must not drop its activation."""
+    m = manager()
+    m.activate(portal.issue("acme.com"))
+    real = portal.handle
+    monkeypatch.setattr(portal, "handle", lambda *a, **k: (429, {"error": "slow down"}))
+    with pytest.raises(ConnectionError):
+        m.refresh()
+    assert m.state() == "active" and m.cert
+    monkeypatch.setattr(portal, "handle", real)
