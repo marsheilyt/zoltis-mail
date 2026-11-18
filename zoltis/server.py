@@ -833,7 +833,7 @@ class App:
                 info = parse_key(key)
                 if domain and domain not in info["domains"]:
                     raise HTTPError(400, f"This license key is for {', '.join(info['domains'])}. "
-                                         f"Use an admin address on that domain, or register {domain} on the licensing portal")
+                                         f"Use an admin address on that domain, or add {domain} to your license on zoltismail.com")
                 self.license.activate(key)
             except LicenseError as e:
                 raise HTTPError(400, str(e))
@@ -1068,7 +1068,7 @@ class App:
         except LicenseError as e:
             raise HTTPError(403, str(e))
         except ConnectionError as e:
-            raise HTTPError(502, f"Couldn't reach the licensing portal: {e}. The current activation stays in use "
+            raise HTTPError(502, f"Couldn't reach zoltismail.com: {e}. The current activation stays in use "
                                  "until it expires")
 
     def adm_accounts(self, req, s):

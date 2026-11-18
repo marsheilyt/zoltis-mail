@@ -581,7 +581,7 @@ function keySteps(L) {
     <li>Sign in at <a href="${esc(L.register_url)}" target="_blank" rel="noopener">zoltismail.com</a> (create a free account if you don't have one).</li>
     <li>Open <b>My account → License keys → Community Edition</b>.</li>
     <li>Enter this server's IP address: ${L.server_ip ? `<code>${esc(L.server_ip)}</code> ${copyBtn(L.server_ip)}` : "<b>the server's public IP</b> (set PUBLIC_IP in .env so it shows here)"}</li>
-    <li>Copy the key, paste it below and click <b>Activate</b>. It's checked with the Zoltis Mail licensing server and only works on this IP.</li></ol>`;
+    <li>Copy the key, paste it below and click <b>Activate</b>. It's checked with zoltismail.com and only works on this IP.</li></ol>`;
 }
 function graceNote(lic) {
   if (!lic || lic.state !== "grace" || !lic.grace_until) return "";
@@ -630,7 +630,7 @@ async function license(body, ctx) {
     <h3 style="font:500 16px var(--font);margin:24px 0 8px">${L.license_id ? "Replace license key" : "Add your license key"}</h3>
     ${L.license_id ? "" : keySteps(L)}
     <p class="muted" style="margin:0 0 12px;font-size:13px">The key is valid for one year from activation and renewed free on zoltismail.com from 30 days before it ends.
-      It's checked with the licensing server every day, so this server needs internet access.</p>
+      It's checked with zoltismail.com every day, so this server needs internet access.</p>
     <textarea id="lic-key" class="lic-key" rows="4" spellcheck="false" placeholder="ZM1.…"></textarea>
     <div style="margin-top:12px"><button class="btn primary" id="lic-save">${icon("check")} Activate</button></div>`;
   $("#lic-save", body).onclick = async (e) => {

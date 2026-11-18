@@ -65,7 +65,7 @@ DEFAULTS = {
         "grace_days": "7",
         # Enterprise Edition license file.
         "key_file": "/etc/zoltis/license.key",
-        # Community Edition: licensing portal that activates keys (blank = built-in default).
+        # Licensing service that activates keys (blank = built-in default: https://zoltismail.com/api/license).
         # The key itself is entered on the setup screen, in Admin console > License,
         # with `zoltis license activate <KEY>`, or via the ZOLTIS_LICENSE_KEY env var.
         "server": "",

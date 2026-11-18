@@ -100,9 +100,9 @@ allowed_domains =
 # starting. Get it at https://zoltismail.com > My account > License keys > Community
 # Edition (enter this server's public IP), then paste it in Admin console > License,
 # use `zoltis license activate <KEY>`, or set ZOLTIS_LICENSE_KEY. It is activated online
-# and checked daily, so the server needs outbound HTTPS to the licensing server.
+# and checked daily, so the server needs outbound HTTPS to zoltismail.com.
 # grace_days = 7
-# server = https://licensing.zoltismail.com
+# server = https://zoltismail.com/api/license
 # Sign-up page behind the admin console's "Upgrade to Mail Pro" buttons
 # (the app adds ?from=community&license=<id>&domains=<list>):
 # upgrade_url = https://zoltismail.com/upgrade

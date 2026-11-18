@@ -48,10 +48,12 @@ log = logging.getLogger("zoltis.license")
 TRUSTED_KEYS: dict[str, str] = {
     # "k1": "<64 hex chars>",
 }
-# Zoltis Mail website: customers sign in, open My account -> License keys -> Community Edition, enter the
-# server's IP address and copy the key. The licensing API that activates keys runs on its own host name.
+# Zoltis Mail website. Licensing is a module of zoltismail.com:
+#   Community / self-hosted: customers sign in, open My account -> License keys -> Community Edition, enter the
+#   server's IP address and copy the key; servers activate and check in at SITE/api/license/v1/...
+#   Managed plans: Zealantis issues the key from the ZOcc dashboard while configuring the server (LICENSE_KEY).
 SITE = "https://zoltismail.com"
-DEFAULT_SERVER = "https://licensing.zoltismail.com"
+DEFAULT_SERVER = SITE + "/api/license"
 DEFAULT_REGISTER_URL = SITE + "/account/licenses"
 # Zoltis sign-up page for the paid managed plans (a separate product; Community only links to it).
 DEFAULT_UPGRADE_URL = SITE + "/upgrade"
@@ -222,7 +224,7 @@ def decode_token(token: str, context: bytes, keys: dict | None = None) -> dict:
         body, sig = _b64d(parts[1]), _b64d(parts[2])
         payload = json.loads(body)
     except (ValueError, TypeError):
-        raise LicenseError("The license key is damaged. Copy it again from the licensing portal")
+        raise LicenseError("The license key is damaged. Copy it again from your account on zoltismail.com")
     if not isinstance(payload, dict):
         raise LicenseError("The license key is damaged")
     pub = keys.get(str(payload.get("kid", "")))
@@ -256,7 +258,7 @@ def parse_key(key: str, now: float | None = None) -> dict:
         raise LicenseError("This key is not for this edition of Zoltis Mail")
     exp = p.get("expires")
     if exp and (now or time.time()) > float(exp):
-        raise LicenseError("This license key has expired. Get a new one from the licensing portal")
+        raise LicenseError("This license key has expired. Get a new one from your account on zoltismail.com")
     return p
 
 
@@ -417,7 +419,7 @@ class LicenseManager:
         if c.get("ip") and _norm_ip(c["ip"]) not in info.get("ips", []):
             raise LicenseError("The activation is for a different server IP address")
         if c.get("status", "active") not in ("active", "overdue", "suspended"):
-            raise LicenseError("The licensing portal reports this license as " + str(c.get("status")))
+            raise LicenseError("zoltismail.com reports this license as " + str(c.get("status")))
         c["_token"] = token
         return c
 
@@ -528,9 +530,9 @@ class LicenseManager:
                 "invalid": f"The license key isn't valid ({self.problem}). Enter a new key in Admin console > License",
                 "expired": "Your license key has expired. Enter a new key in Admin console > License",
                 "inactive": "Your license key hasn't been activated yet. Open Admin console > License and activate it",
-                "lapsed": "This server couldn't confirm its license with the licensing portal. "
+                "lapsed": "This server couldn't confirm its license with zoltismail.com. "
                           "Check the server's internet connection, then click 'Check now' in Admin console > License",
-                "renewal_due": "Your yearly license renewal is due. Renew it (free) on the licensing portal; "
+                "renewal_due": "Your yearly license renewal is due. Renew it (free) in your account on zoltismail.com; "
                                "your key stays the same. Then click 'Check now' in Admin console > License",
                 "suspended": SUSPENDED_MESSAGE,
                 "modified": self.lock_message,
@@ -540,7 +542,7 @@ class LicenseManager:
             raise LicenseRequired(msg)
         if domain is not None and not self.covers(domain):
             raise LicenseRequired(f"Your license covers {', '.join(self.domains)} only. "
-                                  f"Add {domain} to your registration on the licensing portal, then enter the new key")
+                                  f"Add {domain} to your license in your account on zoltismail.com, then enter the new key")
 
     def public(self, full: bool = False) -> dict:
         st = self.state()
@@ -579,10 +581,10 @@ class LicenseManager:
             except ValueError:
                 err = {}
             if 400 <= e.code < 500:
-                raise LicenseError(err.get("error") or f"The licensing portal refused the key (HTTP {e.code})")
-            raise ConnectionError(f"licensing portal error HTTP {e.code}")
+                raise LicenseError(err.get("error") or f"zoltismail.com refused the key (HTTP {e.code})")
+            raise ConnectionError(f"zoltismail.com licensing error HTTP {e.code}")
         except (urllib.error.URLError, OSError, ValueError) as e:
-            raise ConnectionError(f"can't reach the licensing portal at {self.server}: {e}")
+            raise ConnectionError(f"can't reach the Zoltis Mail licensing service at {self.server}: {e}")
 
     def _activate_remote(self, key: str, info: dict) -> dict:
         import platform
@@ -597,7 +599,7 @@ class LicenseManager:
                                         "server_ip": self.public_ip or None})
         token = r.get("activation")
         if not token:
-            raise ConnectionError("the licensing portal sent an unexpected answer")
+            raise ConnectionError("the Zoltis Mail licensing service sent an unexpected answer")
         return self._check_cert(token, info)
 
     def activate(self, key: str) -> dict:

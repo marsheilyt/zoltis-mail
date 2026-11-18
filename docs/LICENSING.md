@@ -1,7 +1,13 @@
 # Community Edition licensing
 
-Community Edition is free, but every install needs a **license key** before it can create email
-accounts or add domains. Customers get a key by registering on the Zoltis licensing portal (SaaS).
+Every install needs a **license key**. Licensing is a module of **zoltismail.com** (no separate host):
+
+- **Community / self-hosted Edition:** the customer signs in at zoltismail.com → My account → License keys →
+  Community Edition, enters the server's IP address and copies the free key. The server activates it and checks in
+  daily at `https://zoltismail.com/api/license/v1/…`.
+- **Managed plans:** Zealantis issues the key from the **ZOcc dashboard** while configuring the customer's server and
+  sets it as `LICENSE_KEY`, so the server is licensed from its first start (no 7-day reminders). Billing and
+  suspension come from ZOcc through the same check-in.
 
 | | |
 |---|---|
@@ -35,9 +41,10 @@ Stored in the data volume: `license.key`, `license.activation`, `install.id` (ra
 2. Put the **public** key in `zoltis/licensing.py` → `TRUSTED_KEYS = {"k1": "<hex>"}`.
    Keep the **private** key only in the portal's secret store. Never commit it.
    To rotate, add `"k2"` next to `"k1"`, sign new keys with k2, and drop k1 in a later release.
-3. The portal URLs in `zoltis/licensing.py`: `SITE = https://zoltismail.com` (customer accounts: `/account/licenses`,
-   `/upgrade`) and `DEFAULT_SERVER = https://licensing.zoltismail.com` (the activation API). Both hosts must be live
-   before the release, or override them with `[license] server`, `register_url` and `upgrade_url`. The upgrade page receives
+3. The URLs in `zoltis/licensing.py`: `SITE = https://zoltismail.com` (customer pages `/account/licenses` and
+   `/upgrade`) and `DEFAULT_SERVER = https://zoltismail.com/api/license` (the licensing module's API: `POST /v1/activate`
+   and `/v1/deactivate` under it). Both must be live before the release, or override them with `[license] server`,
+   `register_url` and `upgrade_url`. The upgrade page receives
    `?from=community&license=<lid>&domains=<comma list>`, so the Mail Pro sign-up can be linked to the existing customer.
 
 4. **Sign every release** after the last change to `zoltis/` or `web/`:
@@ -107,9 +114,10 @@ issues a new key with the same `lid` and the extra domain. The customer pastes i
  "issued": 1795000000, "valid_until": 1797592000}
 ```
 
-## Portal API
+## Licensing API (zoltismail.com module)
 
-JSON over HTTPS. The app sends `User-Agent: ZoltisMail/<version>`.
+JSON over HTTPS at `https://zoltismail.com/api/license` (the paths below are relative to it). The app sends
+`User-Agent: ZoltisMail/<version>`. Keys issued from the ZOcc dashboard for managed plans use the same API.
 
 ### `POST /v1/activate`
 

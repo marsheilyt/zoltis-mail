@@ -21,7 +21,7 @@ STEPS = """To get your free license key:
   2. Open My account > License keys > Community Edition.
   3. Enter this server's IP address: {ip}
   4. Copy the key, then paste it in Admin console > License and click Activate.
-     The key is checked with the Zoltis Mail licensing server; it only works on this server's IP."""
+     The key is checked with zoltismail.com; it only works on this server's IP."""
 
 
 def _due(lic, now) -> tuple[str, str, str] | None:
