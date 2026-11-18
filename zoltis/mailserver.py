@@ -9,6 +9,7 @@ conf_dir layout
     serial                       changes on every render (watchers poll it)
     dovecot/users                passwd-file: mailboxes, SHA512-CRYPT, per-user quota
     dovecot/master-users         master login used by the web app (quota, import, purge)
+    dovecot/app-passwords        passwd-file: app passwords for mail apps (accounts with 2-step verification)
     postfix/domains              virtual_mailbox_domains
     postfix/mailboxes            virtual_mailbox_maps
     postfix/aliases              virtual_alias_maps
@@ -57,6 +58,8 @@ class BundledMailServer:
         self.master_user = g("master_user", "zoltis-master")
         self.master_nets = g("master_allow_nets", "127.0.0.1/32,172.28.0.0/24")
         self.dkim_selector = g("dkim_selector", "zoltis")
+        # Links from the web app to Dovecot use STARTTLS too (plain only for old setups/tests)
+        self.internal_security = g("internal_security", "starttls")
         self.secret_path = os.path.join(data_dir, "master.secret")
         self.lock = threading.Lock()
         self._quota_cache: dict[str, tuple[float, dict]] = {}
@@ -86,21 +89,34 @@ class BundledMailServer:
         return self.dkim_selector, base64.b64encode(der).decode()
 
     # ------------------------------------------------------------------ render
-    def apply(self, snap: dict):
-        """Render every file the mail containers read, then bump the serial."""
+    def apply(self, snap: dict, suspended: bool = False):
+        """Render every file the mail containers read, then bump the serial.
+
+        suspended: managed plan locked for non-payment. Nobody can sign in (IMAP, POP, SMTP), but the
+        mailboxes stay in the user database, so incoming mail is still delivered and kept.
+        """
         with self.lock:
             accounts = snap["accounts"]
             domains = [d["name"] for d in snap["domains"]]
             local = {a["email"] for a in accounts}
-            users = []
+            users, app_pw = [], []
             for a in accounts:
                 if not a.get("pw_hash"):
                     continue
                 extra = [f"userdb_quota_rule=*:storage={int(a['quota_mb'])}M"]
-                if not a["enabled"]:
+                if suspended:
+                    extra += ["nologin=y", "reason=Service_suspended_-_contact_Zoltis_via_the_customer_portal"]
+                elif not a["enabled"]:
                     extra += ["nologin=y", "reason=Account_disabled_by_administrator"]
+                elif a.get("totp_secret"):
+                    # Two-step verification on: the account password only works from the webmail
+                    # container (which asks for the code). Mail apps must use the app password.
+                    extra.append(f"allow_nets={self.master_nets}")
                 users.append(f"{a['email']}:{a['pw_hash']}::::::{' '.join(extra)}")
+                if a["enabled"] and a.get("app_pw_hash") and not suspended:
+                    app_pw.append(f"{a['email']}:{a['app_pw_hash']}::::::")
             _atomic_write(os.path.join(self.conf_dir, "dovecot", "users"), "\n".join(users) + "\n", 0o640)
+            _atomic_write(os.path.join(self.conf_dir, "dovecot", "app-passwords"), "\n".join(app_pw) + "\n", 0o640)
             master_hash = hash_password(self.master_password)
             _atomic_write(os.path.join(self.conf_dir, "dovecot", "master-users"),
                           f"{self.master_user}:{master_hash}::::::allow_nets={self.master_nets}\n", 0o640)
@@ -133,14 +149,14 @@ class BundledMailServer:
 
     # ------------------------------------------------------------------ master login helpers
     def _master(self, email) -> IMAPAccount:
-        a = IMAPAccount(self.imap_host, self.imap_port, "plain", False, f"{email}*{self.master_user}",
+        a = IMAPAccount(self.imap_host, self.imap_port, self.internal_security, False, f"{email}*{self.master_user}",
                         self.master_password, timeout=15)
         a.connect()
         return a
 
     def _master_account(self, email) -> IMAPAccount:
         """Not yet connected (the importer connects it in its own thread)."""
-        return IMAPAccount(self.imap_host, self.imap_port, "plain", False, f"{email}*{self.master_user}",
+        return IMAPAccount(self.imap_host, self.imap_port, self.internal_security, False, f"{email}*{self.master_user}",
                            self.master_password, timeout=60)
 
     def quota(self, email: str, max_age=60) -> dict | None:
@@ -159,6 +175,14 @@ class BundledMailServer:
             return None
         self._quota_cache[email] = (time.time(), q)
         return q
+
+    def deliver_notice(self, email: str, raw: bytes):
+        """Put a system notice straight into a user's Inbox (unread), through the internal master login."""
+        acct = self._master(email)
+        try:
+            acct.append("INBOX", raw, flags=None)
+        finally:
+            acct.close()
 
     def purge_mailbox(self, email: str):
         """Delete every message and folder of a mailbox (used when an account is deleted)."""
@@ -237,6 +261,16 @@ class BundledMailServer:
             rec("TXT", name, f"v=spf1 mx a:{self.hostname} -all", "SPF: who may send"),
             rec("TXT", f"_dmarc.{name}", f"v=DMARC1; p=quarantine; rua=mailto:postmaster@{name}; fo=1", "DMARC policy"),
         ]
+        sts = domain.get("mta_sts") or "testing"
+        if sts != "off":
+            recs += [
+                rec("CNAME", f"mta-sts.{name}", self.hostname,
+                    "MTA-STS: hosts the policy that makes other servers use encryption", proxy="DNS only"),
+                rec("TXT", f"_mta-sts.{name}", f"v=STSv1; id={domain.get('mta_sts_id') or '1'}",
+                    f"MTA-STS policy ({sts}). Update this record whenever you change the mode"),
+                rec("TXT", f"_smtp._tls.{name}", f"v=TLSRPTv1; rua=mailto:postmaster@{name}",
+                    "TLS reports: other servers tell you if encrypted delivery fails"),
+            ]
         if domain.get("dkim_public"):
             recs.append(rec("TXT", f"{domain['dkim_selector']}._domainkey.{name}",
                             f"v=DKIM1; k=rsa; p={domain['dkim_public']}", "DKIM signature key"))
@@ -255,7 +289,7 @@ class ExternalMailServer:
 
     hostname = None
 
-    def apply(self, snap):
+    def apply(self, snap, suspended=False):
         pass
 
     def generate_dkim(self, domain):
@@ -263,6 +297,9 @@ class ExternalMailServer:
 
     def quota(self, email, max_age=60):
         return None
+
+    def deliver_notice(self, email, raw):
+        pass
 
     def purge_mailbox(self, email):
         pass

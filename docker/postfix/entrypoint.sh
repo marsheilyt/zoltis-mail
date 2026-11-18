@@ -64,7 +64,18 @@ configure() {
     "smtpd_tls_auth_only = yes" \
     "smtpd_tls_mandatory_protocols = >=TLSv1.2" \
     "smtpd_tls_protocols = >=TLSv1.2" \
-    "smtp_tls_security_level = may" \
+    "smtpd_tls_mandatory_ciphers = high" \
+    "smtpd_tls_exclude_ciphers = aNULL, eNULL, EXPORT, DES, RC4, MD5, PSK, aECDH, EDH-DSS-DES-CBC3-SHA, EDH-RSA-DES-CBC3-SHA, KRB5-DES, CBC3-SHA" \
+    "tls_preempt_cipherlist = yes" \
+    "tls_ssl_options = NO_COMPRESSION NO_RENEGOTIATION" \
+    "smtpd_tls_received_header = yes" \
+    "smtpd_tls_loglevel = 1" \
+    "smtp_tls_loglevel = 1" \
+    "smtp_tls_note_starttls_offer = yes" \
+    "smtp_tls_mandatory_protocols = >=TLSv1.2" \
+    "smtp_tls_mandatory_ciphers = high" \
+    "smtp_tls_session_cache_database = btree:\${data_directory}/smtp_scache" \
+    "smtpd_tls_session_cache_database = btree:\${data_directory}/smtpd_scache" \
     "smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt" \
     "smtpd_helo_required = yes" \
     "disable_vrfy_command = yes" \
@@ -84,6 +95,43 @@ configure() {
   # Debian's master.cf has postlog commented on some versions; maillog_file needs it.
   grep -q '^postlog' /etc/postfix/master.cf || \
     printf 'postlog   unix-dgram n  -       n       -       1       postlogd\n' >> /etc/postfix/master.cf
+}
+
+# ------------------------------------------------------------------ outgoing encryption policy
+# DANE: verify receiving servers through DNSSEC-signed TLSA records (needs a validating resolver).
+# MTA-STS: enforce TLS + certificate checks for domains that publish a policy (Gmail, Outlook, ...).
+# Everything else: opportunistic TLS. Each layer falls back safely if its helper isn't running.
+start_unbound() {
+  unbound-anchor -a /var/lib/unbound/root.key >/dev/null 2>&1 || true
+  chown unbound:unbound /var/lib/unbound/root.key 2>/dev/null || true
+  unbound -d -c /etc/unbound/zoltis.conf &
+  UB_PID=$!
+}
+start_sts() { mta-sts-daemon -c /etc/mta-sts-daemon.yml >/dev/null 2>&1 & STS_PID=$!; }
+outbound_policy() {
+  local dane=no sts=no
+  [[ -f /etc/resolv.conf.docker ]] || cp /etc/resolv.conf /etc/resolv.conf.docker
+  start_unbound
+  for i in $(seq 1 15); do
+    if dig +short +time=2 @127.0.0.1 dovecot A >/dev/null 2>&1 && \
+       dig +dnssec +time=3 @127.0.0.1 isc.org SOA 2>/dev/null | grep -q " ad[ ;]"; then dane=yes; break; fi
+    sleep 1
+  done
+  if [[ $dane == yes ]]; then
+    printf 'nameserver 127.0.0.1\noptions edns0 trust-ad\n' > /etc/resolv.conf
+    postconf -e "smtp_dns_support_level = dnssec" "smtp_tls_security_level = dane"
+  else
+    cp /etc/resolv.conf.docker /etc/resolv.conf
+    postconf -e "smtp_dns_support_level = enabled" "smtp_tls_security_level = may"
+  fi
+  start_sts
+  for i in $(seq 1 10); do nc -z 127.0.0.1 8461 2>/dev/null && { sts=yes; break; }; sleep 1; done
+  if [[ $sts == yes ]]; then
+    postconf -e "smtp_tls_policy_maps = socketmap:inet:127.0.0.1:8461:postfix"
+  else
+    postconf -e "smtp_tls_policy_maps ="
+  fi
+  log "outgoing encryption: DANE=${dane} MTA-STS=${sts} (otherwise opportunistic TLS)"
 }
 
 # ------------------------------------------------------------------ sync from web container
@@ -118,13 +166,14 @@ start_opendkim() {
 mkdir -p "$TLS" /etc/postfix/zoltis
 install_cert || true
 configure
+outbound_policy
 for i in $(seq 1 60); do [[ -f "$CONF/serial" ]] && break; log "waiting for the web container to render config..."; sleep 2; done
 sync_conf || true
 start_opendkim
 postfix check || true
 postfix start-fg &
 PF_PID=$!
-trap 'postfix stop; kill $DKIM_PID 2>/dev/null; exit 0' TERM INT
+trap 'postfix stop; kill $DKIM_PID ${UB_PID:-} ${STS_PID:-} 2>/dev/null; exit 0' TERM INT
 
 TICK=0
 while kill -0 "$PF_PID" 2>/dev/null; do
@@ -139,4 +188,9 @@ while kill -0 "$PF_PID" 2>/dev/null; do
     if install_cert; then postfix reload || true; fi
   fi
   kill -0 "$DKIM_PID" 2>/dev/null || start_opendkim
+  if [[ -n "${STS_PID:-}" ]] && ! kill -0 "$STS_PID" 2>/dev/null; then log "restarting MTA-STS resolver"; start_sts; fi
+  if [[ -n "${UB_PID:-}" ]] && ! kill -0 "$UB_PID" 2>/dev/null; then
+    log "DNS resolver stopped: falling back to opportunistic TLS"; cp /etc/resolv.conf.docker /etc/resolv.conf
+    postconf -e "smtp_dns_support_level = enabled" "smtp_tls_security_level = may"; postfix reload || true; UB_PID=""
+  fi
 done

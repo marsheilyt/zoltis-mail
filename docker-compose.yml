@@ -19,10 +19,14 @@ services:
       ZOLTIS_SERVER_TRUST_PROXY: "true"
       ZOLTIS_IMAP_HOST: dovecot
       ZOLTIS_IMAP_PORT: "143"
-      ZOLTIS_IMAP_SECURITY: plain
+      # Encrypted inside the private Docker network too (the certificate is for MAIL_HOST,
+      # so the name isn't checked on this internal hop)
+      ZOLTIS_IMAP_SECURITY: starttls
+      ZOLTIS_IMAP_VERIFY_CERT: "false"
       ZOLTIS_SMTP_HOST: postfix
       ZOLTIS_SMTP_PORT: "10587"
-      ZOLTIS_SMTP_SECURITY: plain
+      ZOLTIS_SMTP_SECURITY: starttls
+      ZOLTIS_SMTP_VERIFY_CERT: "false"
       ZOLTIS_MAIL_SERVER_MODE: bundled
       ZOLTIS_MAIL_SERVER_CONF_DIR: /var/lib/zoltis/mailconf
       ZOLTIS_MAIL_SERVER_IMAP_HOST: dovecot
@@ -31,11 +35,12 @@ services:
       ZOLTIS_MAIL_SERVER_WEB_HOSTNAME: ${WEB_HOST:?set WEB_HOST in .env}
       ZOLTIS_MAIL_SERVER_PUBLIC_IP: ${PUBLIC_IP:-}
       ZOLTIS_MAIL_SERVER_MASTER_ALLOW_NETS: 172.28.0.10/32
+      ZOLTIS_MAIL_SERVER_INTERNAL_SECURITY: starttls
       ZOLTIS_BRANDING_APP_NAME: ${APP_NAME:-Zoltis Mail}
       ZOLTIS_SETUP_TOKEN: ${SETUP_TOKEN:-}
       ZOLTIS_LICENSE_KEY: ${LICENSE_KEY:-}
-      ZOLTIS_LICENSE_REQUIRED: ${LICENSE_REQUIRED:-false}
-      ZOLTIS_ANTIVIRUS_ENABLED: ${ANTIVIRUS:-true}
+      ZOLTIS_LICENSE_REQUIRED: ${LICENSE_REQUIRED:-true}
+      ZOLTIS_ANTIVIRUS_ENABLED: ${ANTIVIRUS:-false}   # on only for 4 GB+ servers (install.sh)
       ZOLTIS_ANTIVIRUS_SOCKET: "-"
       ZOLTIS_ANTIVIRUS_HOST: clamav
       ZOLTIS_ANTIVIRUS_PORT: "3310"

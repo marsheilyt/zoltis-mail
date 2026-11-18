@@ -48,6 +48,12 @@ CREATE TABLE IF NOT EXISTS aliases (
     destinations TEXT NOT NULL,
     created INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS policy_acceptance (
+    version TEXT NOT NULL,
+    email TEXT NOT NULL,
+    accepted_at INTEGER NOT NULL,
+    ip TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS audit (
     ts INTEGER NOT NULL,
     actor TEXT NOT NULL,
@@ -57,12 +63,32 @@ CREATE TABLE IF NOT EXISTS audit (
 """
 
 
+# Columns added after 2.0.0 (existing databases are upgraded on start).
+MIGRATIONS = [
+    ("totp_secret", "TEXT"),        # two-step verification secret (None = off)
+    ("totp_last", "INTEGER"),       # last accepted TOTP time step (blocks code reuse)
+    ("recovery_codes", "TEXT"),     # comma-separated SHA-256 of unused recovery codes
+    ("app_pw_hash", "TEXT"),        # password for mail apps (IMAP/SMTP), SHA512-CRYPT
+    ("app_pw_created", "INTEGER"),
+]
+DOMAIN_MIGRATIONS = [
+    # MTA-STS policy published for the domain: off | testing | enforce (+ policy id for the TXT record)
+    ("mta_sts", "TEXT NOT NULL DEFAULT 'testing'"),
+    ("mta_sts_id", "TEXT NOT NULL DEFAULT ''"),
+]
+MTA_STS_MODES = ("off", "testing", "enforce")
+
+
 class AccountError(Exception):
     """User-facing validation error."""
 
 
 class LimitReached(AccountError):
     pass
+
+
+class PoliciesRequired(AccountError):
+    """The current Community Edition policies haven't been accepted yet."""
 
 
 class NotLicensed(AccountError):
@@ -112,6 +138,14 @@ class AccountDB:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(accounts)")}
+        for col, typ in MIGRATIONS:
+            if col not in cols:
+                self.db.execute(f"ALTER TABLE accounts ADD COLUMN {col} {typ}")
+        dcols = {r[1] for r in self.db.execute("PRAGMA table_info(domains)")}
+        for col, typ in DOMAIN_MIGRATIONS:
+            if col not in dcols:
+                self.db.execute(f"ALTER TABLE domains ADD COLUMN {col} {typ}")
         if new:
             os.chmod(path, 0o600)
 
@@ -129,6 +163,33 @@ class AccountDB:
 
     def audit_log(self, limit=200):
         return [dict(r) for r in self._q("SELECT * FROM audit ORDER BY ts DESC LIMIT ?", (limit,))]
+
+    # -------------------------------------------------------------- policies (Community Edition)
+    # Version the admin must have accepted before accounts or domains can be created (None = not needed).
+    policy_version: str | None = None
+
+    def policy_status(self) -> dict:
+        r = self._q("SELECT * FROM policy_acceptance WHERE version = ? ORDER BY accepted_at LIMIT 1",
+                    (self.policy_version or "",))
+        a = dict(r[0]) if r else None
+        return {"required": bool(self.policy_version), "version": self.policy_version,
+                "accepted": bool(a) or not self.policy_version,
+                "accepted_by": a and a["email"], "accepted_at": a and a["accepted_at"]}
+
+    def accept_policies(self, version: str, email: str, ip: str = "") -> dict:
+        if not self.policy_version:
+            return self.policy_status()
+        if str(version) != self.policy_version:
+            raise AccountError(f"Accept the current policies (version {self.policy_version})")
+        self._x("INSERT INTO policy_acceptance(version, email, accepted_at, ip) VALUES (?,?,?,?)",
+                (self.policy_version, (email or "").lower(), int(time.time()), ip or ""))
+        self.audit(email or "system", "policies.accept", f"version {self.policy_version}")
+        return self.policy_status()
+
+    def _require_policies(self):
+        if self.policy_version and not self.policy_status()["accepted"]:
+            raise PoliciesRequired(f"Accept the Zoltis Mail Community Edition policies (version {self.policy_version}) "
+                                   "in the admin console before creating email accounts or domains")
 
     def _require_license(self, domain):
         if self.license is None:
@@ -172,12 +233,25 @@ class AccountDB:
         r = self._q("SELECT * FROM domains WHERE name = ?", (name.lower(),))
         return dict(r[0]) if r else None
 
+    def set_mta_sts(self, name, mode, actor="system") -> dict:
+        """off | testing | enforce. A new policy id is issued so senders re-fetch the policy."""
+        if mode not in MTA_STS_MODES:
+            raise AccountError("MTA-STS mode must be off, testing or enforce")
+        d = self.domain(name or "")
+        if not d:
+            raise AccountError("Domain not found")
+        self._x("UPDATE domains SET mta_sts = ?, mta_sts_id = ? WHERE name = ?",
+                (mode, time.strftime("%Y%m%d%H%M%S", time.gmtime()), d["name"]))
+        self.audit(actor, "domain.mta_sts", f"{d['name']} ({mode})")
+        return self.domain(d["name"])
+
     def add_domain(self, name: str, actor="system") -> dict:
         name = name.strip().lower().rstrip(".")
         if not DOMAIN_RE.match(name):
             raise AccountError(f"'{name}' is not a valid domain name")
         if self.domain(name):
             raise AccountError(f"Domain {name} already exists")
+        self._require_policies()
         self._require_license(name)
         if self.max_domains and len(self.domains()) >= self.max_domains:
             raise LimitReached(f"Community Edition allows up to {self.max_domains} domains. "
@@ -209,6 +283,10 @@ class AccountDB:
     def _pub(r) -> dict:
         d = dict(r)
         d["has_password"] = bool(d.pop("pw_hash", None))
+        d["twofa"] = bool(d.pop("totp_secret", None))
+        d["has_app_password"] = bool(d.pop("app_pw_hash", None))
+        d.pop("totp_last", None)
+        d.pop("recovery_codes", None)
         d["is_admin"] = bool(d["is_admin"])
         d["enabled"] = bool(d["enabled"])
         return d
@@ -251,6 +329,7 @@ class AccountDB:
                 raise AccountError(f"{email} already exists")
             if self._q("SELECT 1 FROM aliases WHERE source = ?", (email,)):
                 raise AccountError(f"{email} is already used as an alias")
+            self._require_policies()
             self._require_license(domain)
             self._check_seat()
             quota = self._check_quota(quota_mb if quota_mb is not None else (self.max_quota or 1024))
@@ -289,6 +368,7 @@ class AccountDB:
                 raise AccountError(f"{email} already exists")
             if self._q("SELECT 1 FROM aliases WHERE source = ?", (email,)):
                 raise AccountError(f"{email} is already used as an alias")
+            self._require_policies()
             self._require_license(domain)
             self._check_seat()
             want = int(a.get("quota_mb") or (self.max_quota or 1024))
@@ -353,6 +433,40 @@ class AccountDB:
                 else:
                     self._x("DELETE FROM aliases WHERE source = ?", (al["source"],))
         self.audit(actor, "account.delete", email)
+
+    # -------------------------------------------------------------- two-step verification
+    def set_totp(self, email, secret, recovery_hashes=(), actor="system"):
+        """Turn two-step verification on (secret) or off (None)."""
+        self._x("UPDATE accounts SET totp_secret = ?, totp_last = NULL, recovery_codes = ? WHERE email = ?",
+                (secret, ",".join(recovery_hashes) if secret else None, email.lower()))
+        self.audit(actor, "account.2fa.on" if secret else "account.2fa.off", email.lower())
+
+    def set_recovery_codes(self, email, hashes):
+        self._x("UPDATE accounts SET recovery_codes = ? WHERE email = ?", (",".join(hashes), email.lower()))
+
+    def use_totp_step(self, email, step) -> bool:
+        """Record an accepted time step; False if it (or a later one) was already used."""
+        with self.lock:
+            cur = self.db.execute("UPDATE accounts SET totp_last = ? WHERE email = ? AND (totp_last IS NULL OR totp_last < ?)",
+                                  (step, email.lower(), step))
+            return cur.rowcount == 1
+
+    def use_recovery_code(self, email, code_hash) -> int | None:
+        """Consume a recovery code. Returns how many are left, or None if it isn't valid."""
+        with self.lock:
+            a = self.get(email)
+            codes = [c for c in ((a or {}).get("recovery_codes") or "").split(",") if c]
+            if code_hash not in codes:
+                return None
+            codes.remove(code_hash)
+            self.set_recovery_codes(email, codes)
+        self.audit(email.lower(), "account.2fa.recovery_used", email.lower())
+        return len(codes)
+
+    def set_app_password(self, email, pw_hash, actor="system"):
+        self._x("UPDATE accounts SET app_pw_hash = ?, app_pw_created = ? WHERE email = ?",
+                (pw_hash, int(time.time()) if pw_hash else None, email.lower()))
+        self.audit(actor, "account.app_password.create" if pw_hash else "account.app_password.delete", email.lower())
 
     def record_login(self, email):
         self._x("UPDATE accounts SET last_login = ? WHERE email = ?", (int(time.time()), email.lower()))

@@ -5,11 +5,19 @@
 A complete, self-hosted email server with a Gmail-style webmail and an admin console. It runs entirely in Docker
 on your own Ubuntu or Linux server.
 
-- **Webmail** that works like Gmail: search, labels, stars, archive and undo, drafts, signatures, dark mode, mobile layout, keyboard shortcuts
+- **Webmail** that works like Gmail: search, labels, stars, archive and undo, drafts, signatures (plain text or HTML, one at a time), light theme by default (dark mode optional), mobile layout, keyboard shortcuts
+- **Mail assistant** (built in, no AI service, nothing leaves the server): inbox tabs (Primary, Promotions, Social,
+  Updates, Forums) sorted from mail headers and senders, learning from where you move mail; a summary card with the key
+  sentences, dates, amounts, deadlines, codes and questions asked of you; spell check while writing (the browser's own)
+- **Spam and Trash**: Spam opens behind a warning screen listing its links, restricted attachments (blocked from
+  download) and fake sender names; links ask before opening. Trash empties itself after 7 days and Spam after 10 days
+  (opened or not), or empty either one now
 - **Admin console**: create and manage email accounts, domains, aliases and sessions, import mail from an old server, view the activity log
 - **Built-in mail server**: Postfix (SMTP) + Dovecot (IMAP) + OpenDKIM, with automatic HTTPS (Let's Encrypt)
-- **Security**: ClamAV antivirus, a risky-attachment blocker, tracking-image blocking, anti-spoofing, DKIM signing on every message
-- **Works with every mail app**: iPhone, Android, Outlook and Thunderbird over IMAP 993 and SMTP 587
+- **Security**: 2-step verification (authenticator app codes + recovery codes) with app passwords for mail apps, ClamAV antivirus, a risky-attachment blocker, tracking-image blocking, anti-spoofing, DKIM signing on every message
+- **Works with every mail app**: iPhone, Android, Outlook and Thunderbird over IMAP 993 and SMTP 587. *Settings → Mail apps*
+- **Ready for the Zoltis Mail app**: sign-in with bearer tokens and a discovery URL (`/.well-known/zoltis-mail.json`). See [docs/MOBILE-APP.md](docs/MOBILE-APP.md)
+  shows each user their exact settings with step-by-step guides, plus a one-tap setup profile for iPhone/iPad Mail
 
 | Community Edition limits | |
 |---|---|
@@ -31,7 +39,7 @@ See the [edition comparison](docs/EDITIONS.md).
 ## Requirements
 
 - A Linux server (Ubuntu 22.04/24.04 or Debian 12 recommended) with a **public IPv4 address**
-- **2 GB RAM**, or 4 GB with antivirus. 10 GB+ disk (10 × 720 MB is about 7 GB of mail)
+- **2 GB RAM**. Antivirus (ClamAV) is turned on only on servers with **4 GB RAM or more**. 10 GB+ disk (10 × 720 MB is about 7 GB of mail)
 - Docker with Compose v2. The installer can install it for you.
 - A domain name you control (for example `yourcompany.com`)
 - **Outbound port 25 open.** Some cloud providers block it until you ask.
@@ -75,10 +83,10 @@ Manual install: `cp .env.example .env`, edit it, then run `docker compose up -d 
 
 ### Small VPS (1 CPU, 1 GB RAM, 20 GB disk)
 
-Zoltis Mail runs on a 1 GB server. On a server with less than 1.5 GB of RAM, `install.sh` does this for you:
+Zoltis Mail runs on a 1 GB server. On small servers `install.sh` does this for you:
 
-- **Antivirus off.** ClamAV alone needs about 1.5 GB of RAM. The risky-attachment blocker (programs, macros,
-  disguised files, archives) keeps working.
+- **Antivirus off below 4 GB RAM.** ClamAV is only enabled on servers with 4 GB of RAM or more (it needs about
+  1.5 GB on its own). The risky-attachment blocker (programs, macros, disguised files, archives) keeps working.
 - **2 GB swap file** (after asking), so a short memory spike doesn't get Postfix, Dovecot or the web app killed.
 - **`POSTFIX_PROCESS_LIMIT=20`** (default 100), so a burst of spam connections can't use up the RAM.
 - Container logs are capped at 30 MB per container, and the Docker build cache is removed after the first build.
@@ -107,7 +115,7 @@ docker compose exec web zoltis accounts list        # accounts and storage used
 docker compose exec web zoltis accounts add jane@yourcompany.com --name "Jane Doe"
 docker compose exec web zoltis doctor yourcompany.com   # deliverability / spam check
 ./scripts/update.sh                                 # update to the latest version (git pull + rebuild)
-./scripts/backup.sh                                 # back up everything to ./backups
+./scripts/backup.sh                                 # encrypted backup (asks for a passphrase) to ./backups
 ```
 
 ## Moving from your current server (Postfix + Dovecot + Roundcube)
@@ -160,7 +168,9 @@ On by default for both sent and received mail (`[attachments]` in the config):
 
 Every outgoing attachment is scanned before sending, and every received attachment before it can be opened.
 Infected files are refused and labelled with the virus name. ClamAV downloads its virus database on first start, which takes about 5 minutes.
-To turn it off on small servers, set `ANTIVIRUS=false` and `COMPOSE_PROFILES=` in `.env`.
+It is enabled automatically on servers with 4 GB of RAM or more and stays off on smaller ones
+(re-running `install.sh` on a smaller server turns it off). Manual switch: `ANTIVIRUS=true|false` and
+`COMPOSE_PROFILES=antivirus` (or empty) in `.env`.
 
 ## Security design
 
@@ -168,14 +178,31 @@ To turn it off on small servers, set `ANTIVIRUS=false` and `COMPOSE_PROFILES=` i
 - Remote images and tracking pixels are blocked until the user allows them.
 - Users can only send as their own address or an alias that delivers to them (Postfix `reject_sender_login_mismatch`).
 - Passwords are stored as SHA512-CRYPT. Failed logins are rate-limited per IP and per account.
+- 2-step verification (TOTP, *Settings → Security*): webmail asks for a code after the password. While it is on, the
+  account password only works from the web container's private IP (Dovecot `allow_nets`), so IMAP/SMTP clients must
+  use the account's app password. Admins can turn it off for a user who lost their phone (*Accounts → ⋮*).
 - The admin console uses an internal Dovecot master login (random 256-bit secret) that only the web container's private IP may use.
+- Encryption in transit everywhere: HTTPS with HSTS (2 years); TLS 1.2+ with forward-secrecy ciphers on IMAP and SMTP;
+  STARTTLS even between containers on the private network.
+- Outgoing mail is verified with DANE (DNSSEC, via a local validating resolver) and MTA-STS where the receiving domain
+  publishes them, opportunistic TLS otherwise. Each domain publishes its own MTA-STS policy and TLS reporting record
+  (*Domains & DNS*: start in `testing`, switch to `enforce` once the reports are clean).
+- Backups made with `scripts/backup.sh` are encrypted with your passphrase (AES-256). Stored mailboxes are not
+  encrypted per user; protect the server disk with your provider's disk encryption.
+- Code integrity: every release is signed (`zoltis/RELEASE.manifest`). Changed program files, including the logo,
+  lock the service and are reported at the daily license check-in (see `docs/LICENSING.md`).
+- Community Edition policies (`web/legal/community-policies-v1.0.md`): the first administrator must accept them on
+  the setup screen; who accepted which version, and when, is stored and shown in *Admin console → License*. When a new
+  version ships, account and domain creation pauses until an admin accepts it.
+- Community Edition always shows the Zoltis Mail name and logo. `APP_NAME`, `[branding] company` and
+  `primary_color` only take effect on Enterprise (custom branding).
 - Only ports 25, 80, 443, 465, 587 and 993 are published. Everything else stays on a private Docker network.
 
 ## Development
 
 ```bash
 python3 devtools/demo.py        # full demo without Docker (emulated mail server), setup code DEMO1234
-python3 -m pytest -q tests      # 107 tests
+python3 -m pytest -q tests      # 141 tests
 ```
 
 Project layout:
@@ -191,4 +218,5 @@ docs/            Architecture, deliverability, editions
 
 ## License
 
-See [LICENSE](LICENSE).
+Zoltis Mail Community License: free to run the official release for your own organisation with a free license key
+from [zoltismail.com](https://zoltismail.com). See [LICENSE](LICENSE).

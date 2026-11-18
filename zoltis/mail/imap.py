@@ -394,12 +394,94 @@ class IMAPAccount:
         return (crit or ["ALL"]), utf8
 
     # -- messages ----------------------------------------------------------
-    def list_messages(self, folder: str, page=0, page_size=50, query: str = "") -> dict:
+    # ------------------------------------------------------------ inbox categories (see assistant.py)
+    @staticmethod
+    def _cat_crit(category: str) -> list[str]:
+        from . import assistant as A
+        if category == "primary":     # everything not sorted into another tab (also not-yet-classified mail)
+            out = []
+            for cat in A.CATEGORIES[1:]:
+                out += ["UNKEYWORD", A.keyword(cat)]
+            return out
+        return ["KEYWORD", A.keyword(category)]
+
+    def categorize(self, folder: str, is_contact, overrides: dict, limit: int = 1000) -> int:
+        """Classify messages that have no category keyword yet (newest first, up to `limit` per call)."""
+        from . import assistant as A
+
+        def go(c):
+            self._select(c, folder, readonly=False)
+            crit = []
+            for cat in A.CATEGORIES:
+                crit += ["UNKEYWORD", A.keyword(cat)]
+            typ, d = c.uid("SEARCH", *crit)
+            if typ != "OK":
+                return 0
+            uids = sorted((int(x) for x in (d[0] or b"").split()), reverse=True)[:limit]
+            groups: dict[str, list[int]] = {}
+            fields = " ".join(A.CATEGORY_HEADERS)
+            for i in range(0, len(uids), 250):
+                chunk = uids[i:i + 250]
+                typ, data = c.uid("FETCH", ",".join(map(str, chunk)), f"(UID BODY.PEEK[HEADER.FIELDS ({fields})])")
+                for m in _parse_fetch(data):
+                    raw = next((v for k, v in m["parts"].items() if k.startswith("BODY[HEADER")), b"")
+                    hdr = email.message_from_bytes(raw, policy=email.policy.compat32)
+                    h = {k.lower(): _dh(v) for k, v in hdr.items()}
+                    frm = (_addrs(hdr.get("From")) or [{}])[0].get("email", "").lower()
+                    h["from"] = frm
+                    cat = A.classify(h, known_contact=is_contact(frm),
+                                     override=overrides.get(frm) or overrides.get("@" + frm.rsplit("@", 1)[-1]))
+                    groups.setdefault(cat, []).append(m["uid"])
+            for cat, us in groups.items():
+                typ, _ = c.uid("STORE", ",".join(map(str, us)), "+FLAGS.SILENT", f"({A.keyword(cat)})")
+                if typ != "OK":
+                    raise MailError("This mail server doesn't support message keywords")
+            return sum(len(v) for v in groups.values())
+        return self._run(go)
+
+    def category_unread(self, folder: str) -> dict:
+        from . import assistant as A
+
+        def go(c):
+            self._select(c, folder, readonly=True)
+            out = {}
+            for cat in A.CATEGORIES:
+                typ, d = c.uid("SEARCH", "UNSEEN", *self._cat_crit(cat))
+                out[cat] = len((d[0] or b"").split()) if typ == "OK" and d else 0
+            return out
+        return self._run(go)
+
+    def set_category(self, folder: str, uids: list[int], category: str):
+        from . import assistant as A
+        if category not in A.CATEGORIES or not uids:
+            return
+
+        def go(c):
+            self._select(c, folder, readonly=False)
+            uidset = ",".join(map(str, uids))
+            others = " ".join(A.keyword(x) for x in A.CATEGORIES if x != category)
+            c.uid("STORE", uidset, "-FLAGS.SILENT", f"({others})")
+            c.uid("STORE", uidset, "+FLAGS.SILENT", f"({A.keyword(category)})")
+        self._run(go)
+
+    def uids_from(self, folder: str, sender: str) -> list[int]:
+        def go(c):
+            self._select(c, folder, readonly=True)
+            typ, d = c.uid("SEARCH", "FROM", _quote(sender))
+            return [int(x) for x in (d[0] or b"").split()] if typ == "OK" else []
+        return self._run(go)
+
+    def list_messages(self, folder: str, page=0, page_size=50, query: str = "", category: str = "") -> dict:
         def go(c):
             exists = self._select(c, folder, readonly=True)
             if exists == 0:
                 return {"folder": folder, "total": 0, "page": page, "messages": []}
-            if query or folder == "__starred__":
+            if category and not query:
+                typ, d = c.uid("SEARCH", *self._cat_crit(category))
+                if typ != "OK":
+                    raise MailError("Search failed")
+                uids = [int(x) for x in (d[0] or b"").split()]
+            elif query or folder == "__starred__":
                 crit, utf8 = self.build_search(query)
                 if utf8:
                     c.literal = utf8.encode()
@@ -453,6 +535,7 @@ class IMAPAccount:
                     "has_attachment": m["has_attachment"] or "multipart/mixed" in ct,
                     "snippet": self.preview_cache.get((folder, self._uidvalidity, u), ""),
                     "message_id": (hdr.get("Message-ID") or "").strip(),
+                    "category": next((f[4:] for f in flags if f.startswith("$zc-")), None),
                 })
             return {"folder": folder, "total": total, "page": page, "page_size": page_size, "messages": out}
         return self._run(go)

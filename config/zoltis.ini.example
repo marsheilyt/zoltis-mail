@@ -83,6 +83,8 @@ archive_max_files = 5000
 archive_max_uncompressed_mb = 1024
 
 [branding]
+# app_name, company and primary_color are Enterprise only (custom branding).
+# Community Edition always shows the Zoltis Mail name and logo.
 app_name = Zoltis Mail
 company =
 primary_color = #0b57d0
@@ -92,16 +94,18 @@ default_domain =
 allowed_domains =
 
 [license]
-# Licensing is turned off by default (no key needed). Set to true to require a key.
-# required = false
-# Community Edition: every install needs a (free) license key before it can create
-# email accounts. Enter it on the setup screen, in Admin console > License, with
-# `zoltis license activate <KEY>`, or set ZOLTIS_LICENSE_KEY. It is activated online
-# once and renewed daily, so the server needs outbound HTTPS to the licensing portal.
-# server = https://licensing.zoltis.example
+# Licensing is on by default from 2.3.0. false is for development only.
+# required = true
+# From 2.3.0 every install needs a free license key, added within grace_days of first
+# starting. Get it at https://zoltismail.com > My account > License keys > Community
+# Edition (enter this server's public IP), then paste it in Admin console > License,
+# use `zoltis license activate <KEY>`, or set ZOLTIS_LICENSE_KEY. It is activated online
+# and checked daily, so the server needs outbound HTTPS to the licensing server.
+# grace_days = 7
+# server = https://licensing.zoltismail.com
 # Sign-up page behind the admin console's "Upgrade to Mail Pro" buttons
 # (the app adds ?from=community&license=<id>&domains=<list>):
-# upgrade_url = https://licensing.zoltis.example/upgrade
+# upgrade_url = https://zoltismail.com/upgrade
 # Enterprise Edition only
 key_file = /etc/zoltis/license.key
 

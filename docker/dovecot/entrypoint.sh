@@ -36,7 +36,7 @@ sync_conf() {
   [[ -f "$CONF/serial" ]] || return 1
   local s; s=$(cat "$CONF/serial")
   [[ "$s" == "$SERIAL" ]] && return 1
-  for f in users master-users; do
+  for f in users master-users app-passwords; do
     install -m 0640 -o root -g dovecot "$CONF/dovecot/$f" "/etc/dovecot/zoltis/$f.new" 2>/dev/null || install -m 0640 -o root -g dovecot /dev/null "/etc/dovecot/zoltis/$f.new"
     mv "/etc/dovecot/zoltis/$f.new" "/etc/dovecot/zoltis/$f"   # passwd-file is re-read automatically
   done
@@ -46,7 +46,7 @@ sync_conf() {
 }
 
 install_cert || true
-for f in users master-users; do [[ -f /etc/dovecot/zoltis/$f ]] || install -m 0640 -o root -g dovecot /dev/null /etc/dovecot/zoltis/$f; done
+for f in users master-users app-passwords; do [[ -f /etc/dovecot/zoltis/$f ]] || install -m 0640 -o root -g dovecot /dev/null /etc/dovecot/zoltis/$f; done
 for i in $(seq 1 60); do [[ -f "$CONF/serial" ]] && break; log "waiting for the web container to render config..."; sleep 2; done
 sync_conf || true
 dovecot -F &

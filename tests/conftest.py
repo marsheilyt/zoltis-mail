@@ -16,6 +16,10 @@ TEST_KID = "test"
 
 # The licensing tests exercise enforcement, which is off by default.
 os.environ.setdefault("ZOLTIS_LICENSE_REQUIRED", "true")
+# The source tree under test isn't a signed release; test_integrity.py covers the code check.
+os.environ.setdefault("ZOLTIS_INTEGRITY_ENFORCE", "false")
+# Most tests check behaviour after the 7-day registration period; test_license.py covers the period itself.
+os.environ.setdefault("ZOLTIS_LICENSE_GRACE_DAYS", "0")
 
 
 @pytest.fixture(scope="session")

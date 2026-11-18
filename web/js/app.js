@@ -30,6 +30,31 @@ function fmtDate(iso, long = false) {
 }
 
 class ApiError extends Error { constructor(msg, status) { super(msg); this.status = status; } }
+// Minimal, safe Markdown for the policies text: headings, lists, paragraphs, links (everything escaped).
+function mdToHtml(md) {
+  const inline = (t) => esc(t).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+    .replace(/(https:\/\/[^\s<)]+[^\s<).,;])/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
+  let out = "", list = false;
+  for (const raw of String(md || "").split(/\r?\n/)) {
+    const line = raw.trim();
+    const li = /^[-*] (.*)$/.exec(line);
+    if (list && !li) { out += "</ul>"; list = false; }
+    if (!line) continue;
+    const hd = /^(#{1,3}) (.*)$/.exec(line);
+    if (hd) out += `<h${hd[1].length}>${inline(hd[2])}</h${hd[1].length}>`;
+    else if (li) { if (!list) { out += "<ul>"; list = true; } out += `<li>${inline(li[1])}</li>`; }
+    else out += `<p>${inline(line)}</p>`;
+  }
+  return out + (list ? "</ul>" : "");
+}
+async function loadPolicies(p, box) {
+  try {
+    const r = await fetch(p.url, { credentials: "same-origin" });
+    if (!r.ok) throw new Error();
+    box.innerHTML = mdToHtml(await r.text());
+  } catch (e) { box.innerHTML = `<p>Couldn't load the policies. <a href="${esc(p.url)}" target="_blank" rel="noopener">Open them here</a>.</p>`; }
+}
+
 async function api(path, opts = {}) {
   const init = { method: opts.method || "GET", headers: { "X-Zoltis": "1" }, credentials: "same-origin" };
   if (opts.body !== undefined) { init.headers["Content-Type"] = "application/json"; init.body = JSON.stringify(opts.body); }
@@ -37,6 +62,7 @@ async function api(path, opts = {}) {
   try { res = await fetch(path, init); } catch (e) { throw new ApiError("Can't reach the server. Check your connection.", 0); }
   const data = await res.json().catch(() => ({}));
   if (res.status === 401 && !opts.noAuthRedirect) { showLogin(); throw new ApiError(data.error || "Please sign in", 401); }
+  if (res.status === 428) window.dispatchEvent(new CustomEvent("zoltis:policies"));   // policies not accepted yet
   if (!res.ok) throw new ApiError(data.error || `Error ${res.status}`, res.status);
   return data;
 }
@@ -48,7 +74,10 @@ const S = {
   folderKey: "inbox", folder: "INBOX", page: 0, q: "", baseQ: "",
   list: [], total: 0, pageSize: 50, selected: new Set(), focus: -1,
   current: null, view: "list", loading: false, lastUnread: null,
+  category: "primary", cats: null, spamOk: new Set(),   // spam messages the user chose to open anyway     // inbox tab and its unread counts (null = tabs off)
 };
+const CATS = [["primary", "inbox", "Primary"], ["promotions", "sell", "Promotions"], ["social", "group", "Social"],
+  ["updates", "info", "Updates"], ["forums", "forum", "Forums"]];
 const ROLE_META = {
   inbox: ["inbox", "Inbox"], starred: ["star_border", "Starred"], sent: ["send", "Sent"],
   drafts: ["draft", "Drafts"], archive: ["archive", "Archive"], junk: ["report", "Spam"],
@@ -102,6 +131,18 @@ function prompt(title, label, value = "") {
   });
 }
 
+// In-app confirmation (never the browser's own confirm box). Resolves true when the user agrees.
+function ask(title, text, okLabel = "OK", danger = false) {
+  return new Promise((resolve) => {
+    let done = false;
+    modal({
+      title, body: `<p style="margin:0;white-space:pre-line">${esc(text)}</p>`,
+      buttons: [{ label: "Cancel" }, { label: okLabel, cls: danger ? "danger" : "primary", onClick: () => { done = true; resolve(true); } }],
+      onClose: () => !done && resolve(false),
+    });
+  });
+}
+
 // ---------------------------------------------------------------- popover menus
 function popover(anchor, items) {
   const p = $("#popover");
@@ -135,26 +176,63 @@ function folderPicker(anchor, cb) {
 
 // ---------------------------------------------------------------- theme / branding
 function applyTheme() {
-  const t = S.settings.theme || "system";
+  const t = S.settings.theme || "light";
   const dark = t === "dark" || (t === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
   document.documentElement.dataset.theme = dark ? "dark" : "light";
+  $$(".brand img, .login-logo").forEach((i) => (i.src = dark ? "/img/logo-dark.svg" : "/img/logo.svg"));
   document.documentElement.dataset.density = S.settings.density || "default";
 }
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", applyTheme);
 function applyBranding() {
   const c = S.config;
-  $$(".app-name").forEach((e) => (e.textContent = c.app_name || "Mail"));
-  if (c.primary_color && /^#[0-9a-f]{3,8}$/i.test(c.primary_color) && c.primary_color.toLowerCase() !== "#0b57d0")
+  $$(".app-name").forEach((e) => (e.textContent = c.app_name || "Zoltis Mail"));
+  // Community Edition always shows the Zoltis Mail wordmark; only Enterprise custom branding shows its own name.
+  if (!c.custom_branding || /^\s*zoltis\s+mail\s*$/i.test(c.app_name || ""))
+    $$(".brand-name").forEach((e) => { e.innerHTML = '<b class="wm-z">ZOLTIS</b> <span class="wm-m">Mail</span>'; e.classList.add("wordmark"); });
+  if (c.custom_branding && c.primary_color && /^#[0-9a-f]{3,8}$/i.test(c.primary_color) && c.primary_color.toLowerCase() !== "#0b57d0")
     document.documentElement.style.setProperty("--primary", c.primary_color);
   $("#login-edition").textContent = `${c.edition === "enterprise" ? "Enterprise" : "Community"} Edition ${c.version || ""}`;
   document.title = c.app_name || "Mail";
+  if (c.license?.suspended) $("#login-error").textContent = c.license.message;   // managed plan unpaid
 }
 
 // ---------------------------------------------------------------- login
+// ---------------------------------------------------------------- sign-in page clocks
+// Server time: the time zone chosen when the server was set up (the admin's local zone), on the server's clock.
+// Your time: this device's own time zone and clock.
+const browserTz = () => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"; } catch (e) { return "UTC"; } };
+let clockTimer = null;
+function fmtClock(ms, tz) {
+  const d = new Date(ms);
+  const opt = (o) => { try { return new Intl.DateTimeFormat(undefined, { ...o, timeZone: tz }).format(d); } catch (e) { return new Intl.DateTimeFormat(undefined, { ...o, timeZone: "UTC" }).format(d); } };
+  let off = "";
+  try { off = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "shortOffset" }).formatToParts(d).find((p) => p.type === "timeZoneName")?.value || ""; } catch (e) {}
+  const place = tz === "UTC" ? "UTC" : tz.split("/").pop().replace(/_/g, " ");
+  return { time: opt({ hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+           sub: `${opt({ weekday: "short", day: "numeric", month: "short" })} · ${place}${off && place !== "UTC" ? ` (${off})` : ""}` };
+}
+function startClocks() {
+  const st = S.config.server_time;
+  const skew = st && st.now ? st.now * 1000 - Date.now() : 0;      // server clock minus this device's clock
+  const stz = (st && st.timezone) || "UTC", ltz = browserTz();
+  const note = $("#clock-note");
+  const mins = Math.round(Math.abs(skew) / 60000);
+  note.classList.toggle("hidden", mins < 2);
+  if (mins >= 2) note.textContent = `This device's clock is ${mins} minute${mins === 1 ? "" : "s"} ${skew > 0 ? "behind" : "ahead of"} the server.`;
+  const tick = () => {
+    if ($("#login").classList.contains("hidden")) { clearInterval(clockTimer); clockTimer = null; return; }
+    const s = fmtClock(Date.now() + skew, stz), l = fmtClock(Date.now(), ltz);
+    $("#clock-server").textContent = s.time; $("#clock-server-sub").textContent = s.sub;
+    $("#clock-local").textContent = l.time; $("#clock-local-sub").textContent = l.sub;
+  };
+  clearInterval(clockTimer); tick(); clockTimer = setInterval(tick, 1000);
+}
+
 function showLogin() {
   stopPolling();
   $("#app").classList.add("hidden");
   $("#login").classList.remove("hidden");
+  startClocks();
   const dd = S.config.default_domain;
   $("#login-email").placeholder = " ";
   if (dd) $("#login-email").closest(".field").querySelector("span").textContent = `Email or username (@${dd})`;
@@ -166,12 +244,45 @@ $("#login-form").onsubmit = async (e) => {
   const btn = $("#login-btn"), err = $("#login-error");
   err.innerHTML = ""; btn.disabled = true; btn.textContent = "Signing in…";
   try {
-    await api("/api/login", { method: "POST", body: { email: $("#login-email").value, password: $("#login-password").value }, noAuthRedirect: true });
+    const r = await api("/api/login", { method: "POST", body: { email: $("#login-email").value, password: $("#login-password").value }, noAuthRedirect: true });
     $("#login-password").value = "";
+    if (r.twofa_required) { showTwoFactor(r); return; }
     await startApp();
   } catch (ex) {
     err.innerHTML = icon("error") + esc(ex.message);
   } finally { btn.disabled = false; btn.textContent = "Sign in"; }
+};
+let loginTicket = null;
+function showTwoFactor(r) {
+  loginTicket = r.ticket;
+  $("#login-form").classList.add("hidden");
+  $("#login-2fa-form").classList.remove("hidden");
+  $("#login-2fa-sub").textContent = `Enter the 6-digit code from your authenticator app for ${r.email}`;
+  $("#login-code").value = ""; $("#login-2fa-error").innerHTML = "";
+  setTimeout(() => $("#login-code").focus(), 50);
+}
+function backToPassword() {
+  loginTicket = null;
+  $("#login-2fa-form").classList.add("hidden");
+  $("#login-form").classList.remove("hidden");
+  setTimeout(() => $("#login-password").focus(), 50);
+}
+$("#login-2fa-back").onclick = backToPassword;
+$("#login-2fa-form").onsubmit = async (e) => {
+  e.preventDefault();
+  const btn = $("#login-2fa-btn"), err = $("#login-2fa-error");
+  err.innerHTML = ""; btn.disabled = true; btn.textContent = "Verifying…";
+  try {
+    const r = await api("/api/login/2fa", { method: "POST", body: { ticket: loginTicket, code: $("#login-code").value }, noAuthRedirect: true });
+    loginTicket = null;
+    $("#login-2fa-form").classList.add("hidden"); $("#login-form").classList.remove("hidden");
+    await startApp();
+    if (r.recovery_left !== undefined) snack(`You used a recovery code. ${r.recovery_left} left. Create new ones in Settings → Security.`, "Open", () => openSettings("security"), 0);
+  } catch (ex) {
+    if (ex.status === 401 && /expired/i.test(ex.message)) { backToPassword(); $("#login-error").innerHTML = icon("error") + esc(ex.message); return; }
+    err.innerHTML = icon("error") + esc(ex.message);
+    $("#login-code").select();
+  } finally { btn.disabled = false; btn.textContent = "Verify"; }
 };
 
 // ---------------------------------------------------------------- app start
@@ -187,9 +298,36 @@ function showSetup() {
   $("#setup").classList.remove("hidden");
   const lic = S.config.license || {};
   $("#setup-register").href = lic.register_url || "#";
-  $("#setup-license-box").classList.toggle("hidden", !!lic.active);
+  // From 2.3.0 a key is needed, but setup can finish without one: there are 7 days to add it.
+  $("#setup-license-box").classList.toggle("hidden", !lic.required || lic.state === "active");
   if (lic.active && lic.domains?.length) $("#setup-email").placeholder = "admin@" + lic.domains[0];
+  const pol = S.config.policies;
+  $("#setup-policies").classList.toggle("hidden", !pol);
+  if (pol) {
+    $("#setup-policy-ver").textContent = pol.version;
+    $("#setup-policy-link").href = pol.url;
+    $("#setup-terms-link").href = pol.terms_url;
+    loadPolicies(pol, $("#setup-policy-text"));
+  }
+  $("#setup-ip").textContent = lic.server_ip ? ` (${lic.server_ip})` : "";
   setTimeout(() => $("#setup-token").focus(), 50);
+}
+// Admins see a reminder above the mail list while the server has no license key or it needs renewing.
+function licenseBanner() {
+  const el = $("#lic-banner"), L = S.config.license || {};
+  let msg = "", off = false;
+  const day = (t) => new Date(t * 1000).toLocaleDateString();
+  if (S.me?.is_admin && L.required) {
+    if (L.state === "grace" && L.grace_until) {
+      const d = Math.max(0, Math.ceil((L.grace_until * 1000 - Date.now()) / 86400000));
+      msg = `Add your free license key within ${d} day${d === 1 ? "" : "s"} (by ${day(L.grace_until)}). Get it at zoltismail.com → My account → License keys.`;
+    } else if (L.state === "missing") { msg = "This server has no license key: new accounts and domains are paused."; off = true; }
+    else if (L.billing?.status === "renew_soon") msg = `Your license ends on ${day(L.billing.paid_until)}. Renew it free at zoltismail.com.`;
+    else if (L.state === "renewal_due") { msg = "Your license has expired: new accounts and domains are paused until you renew it at zoltismail.com."; off = true; }
+  }
+  el.classList.toggle("hidden", !msg); el.classList.toggle("off", off);
+  if (msg) el.innerHTML = `${icon("warning")}<span>${esc(msg)}</span> <a href="#/admin/license">Add license key</a>`;
+  if (msg && L.state !== "grace" && L.state !== "missing") el.lastElementChild.textContent = "Open License";
 }
 $("#setup-form").onsubmit = async (e) => {
   e.preventDefault();
@@ -197,10 +335,15 @@ $("#setup-form").onsubmit = async (e) => {
   err.innerHTML = "";
   const pw = $("#setup-password").value;
   if (pw !== $("#setup-password2").value) { err.innerHTML = icon("error") + "Passwords don't match"; return; }
+  const pol = S.config.policies;
+  if (pol && !$("#setup-accept").checked) {
+    err.innerHTML = icon("error") + "Read and accept the Community Edition policies to continue";
+    $("#setup-accept").focus(); return;
+  }
   btn.disabled = true; btn.textContent = "Setting up…";
   try {
     const email = $("#setup-email").value.trim();
-    await api("/api/setup", { method: "POST", body: { token: $("#setup-token").value, license_key: $("#setup-license").value, name: $("#setup-name").value, email, password: pw }, noAuthRedirect: true });
+    await api("/api/setup", { method: "POST", body: { token: $("#setup-token").value, license_key: $("#setup-license").value, name: $("#setup-name").value, email, password: pw, accept_policies: pol ? pol.version : undefined, timezone: browserTz() }, noAuthRedirect: true });
     await api("/api/login", { method: "POST", body: { email, password: pw }, noAuthRedirect: true });
     S.config.setup_needed = false;
     $("#setup").classList.add("hidden");
@@ -222,6 +365,7 @@ async function startApp() {
   $("#me-email").textContent = S.me.email;
   $("#me-edition").textContent = `${S.me.edition === "enterprise" ? "Enterprise" : "Community"} Edition` + (S.me.licensed_to ? ` · ${S.me.licensed_to}` : "");
   renderEnterpriseNav();
+  licenseBanner();
   $("#admin-link").classList.toggle("hidden", !S.me.is_admin);
   loadQuota();
   await loadFolders();
@@ -248,7 +392,8 @@ function renderFolders() {
     if (role === "starred") { if (inbox) items.push({ key: "starred", icon: "star_border", label: "Starred", count: 0 }); continue; }
     const f = specials.find((x) => x.role === role);
     if (!f) continue;
-    const cnt = role === "drafts" ? f.total : role === "trash" || role === "sent" || role === "archive" || role === "all" ? 0 : f.unread;
+    // Inbox: unread · Drafts and Spam: how many are in there · Trash, Sent, Archive: no number
+    const cnt = role === "drafts" || role === "junk" ? f.total : role === "trash" || role === "sent" || role === "archive" || role === "all" ? 0 : f.unread;
     items.push({ key: role, icon: ROLE_META[role][0], label: ROLE_META[role][1], count: cnt, folder: f });
   }
   for (const it of items) sys.append(folderEl(it));
@@ -272,7 +417,7 @@ function folderEl(it) {
   if (it.custom) a.addEventListener("contextmenu", (e) => {
     e.preventDefault();
     popover(a, [{ label: `Delete label "${it.label}"`, icon: "delete", onClick: async () => {
-      if (!confirm(`Delete "${it.label}" and all messages in it?`)) return;
+      if (!(await ask(`Delete label "${it.label}"?`, "The label and all messages in it will be deleted.", "Delete", true))) return;
       try { await api("/api/folders?" + qs({ name: it.folder.name }), { method: "DELETE" }); await loadFolders(); if (S.folder === it.folder.name) location.hash = "#/inbox"; snack("Label deleted"); } catch (er) { fail(er); }
     } }]);
   });
@@ -339,18 +484,56 @@ async function loadList(render = true) {
   if (render && !S.list.length) listEl.innerHTML = `<div class="loading-bar"></div>`;
   else if (render) listEl.insertAdjacentHTML("afterbegin", `<div class="loading-bar" style="position:sticky;top:0"></div>`);
   try {
-    const r = await api("/api/messages?" + qs({ folder: S.folder, page: S.page, q: query }));
+    const tabbed = S.folderKey === "inbox" && !S.searchMode;
+    const r = await api("/api/messages?" + qs({ folder: S.folder, page: S.page, q: query, category: tabbed ? S.category : undefined }));
     if (seq !== listSeq) return;
+    S.cats = tabbed && r.categories ? r.categories : null;
     S.list = r.messages; S.total = r.total; S.pageSize = r.page_size || S.settings.page_size || 50;
     if (render || S.view === "list") renderList();
   } catch (e) { if (seq === listSeq) { listEl.innerHTML = `<div class="empty">${icon("error")}<p>${esc(e.message)}</p><button class="btn outline" id="retry">Try again</button></div>`; $("#retry") && ($("#retry").onclick = () => loadList()); } fail(e); }
 }
+function renderCatTabs() {
+  const el = $("#cat-tabs");
+  el.classList.toggle("hidden", !S.cats);
+  $("#bulk-category").classList.toggle("hidden", !S.cats);
+  if (!S.cats) return;
+  el.innerHTML = CATS.map(([k, ic, label]) => {
+    const n = S.cats[k] || 0;
+    return `<button class="cat-tab ${k === S.category ? "on" : ""}" role="tab" aria-selected="${k === S.category}" data-cat="${k}">
+      ${icon(ic)}<span>${label}</span>${n && k !== S.category ? `<span class="cat-new">${n > 99 ? "99+" : n} new</span>` : n ? `<span class="cat-count">${n}</span>` : ""}</button>`;
+  }).join("");
+}
+$("#cat-tabs").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-cat]"); if (!b || b.dataset.cat === S.category) return;
+  S.category = b.dataset.cat; S.page = 0; S.selected.clear(); S.list = [];
+  if (location.hash !== "#/inbox") location.hash = "#/inbox"; else loadList();
+});
+function renderFolderBanner() {
+  const el = $("#folder-banner"), f = folderByKey(S.folderKey);
+  const role = f && f.role;
+  if (S.searchMode || !(role === "trash" || role === "junk") || !S.list.length) { el.classList.add("hidden"); return; }
+  const auto = S.config.mail_mode === "bundled";      // the bundled mail server deletes old Trash and Spam itself
+  el.innerHTML = role === "trash"
+    ? `${auto ? "Messages that have been in Trash more than 7 days are deleted automatically." : "Messages in Trash take up storage until you delete them."} <button class="btn text" data-empty>Empty Trash now</button>`
+    : `${auto ? "Messages that have been in Spam more than 10 days are deleted automatically, opened or not." : `Spam: ${S.total.toLocaleString()} message${S.total === 1 ? "" : "s"}.`} <button class="btn text" data-empty>Delete all spam messages now</button>`;
+  el.classList.remove("hidden");
+}
+$("#folder-banner").addEventListener("click", (e) => {
+  if (!e.target.closest("[data-empty]")) return;
+  const f = folderByKey(S.folderKey), trash = f.role === "trash", n = S.total;
+  modal({ title: trash ? "Empty Trash?" : "Delete all spam?", body: `<p>${n.toLocaleString()} message${n === 1 ? "" : "s"} will be deleted forever. This can't be undone.</p>`,
+    buttons: [{ label: "Cancel" }, { label: trash ? "Empty Trash" : "Delete all", cls: "danger", onClick: async () => {
+      try { const r = await api("/api/folders/empty", { method: "POST", body: { folder: S.folder } }); snack(`${r.deleted.toLocaleString()} message${r.deleted === 1 ? "" : "s"} deleted forever`); S.list = []; loadList(); loadFolders(); loadQuota(); }
+      catch (err) { snack(err.message); return false; }
+    } }] });
+});
 function isOutgoing() { const f = folderByKey(S.folderKey); return f && (f.role === "sent" || f.role === "drafts"); }
 function renderList() {
   const listEl = $("#list");
   const banner = $("#search-banner");
   if (S.searchMode) { banner.classList.remove("hidden"); banner.innerHTML = `Search results for <b>${esc(S.q)}</b> in ${esc(ROLE_META[S.folderKey]?.[1] || S.folder)} · <a href="#/${S.folderKey}">Clear search</a>`; }
   else banner.classList.add("hidden");
+  renderCatTabs(); renderFolderBanner();
   const start = S.total ? S.page * S.pageSize + 1 : 0, end = Math.min(S.total, (S.page + 1) * S.pageSize);
   $("#pager-text").textContent = S.total ? `${start}–${end} of ${S.total.toLocaleString()}` : "";
   $("#prev-page").disabled = S.page === 0;
@@ -470,7 +653,7 @@ async function bulkAction(act, uids, anchor) {
     case "notspam": return moveMessages(uids, "INBOX", "Conversation moved to Inbox");
     case "delete": {
       if (f && (f.role === "trash" || f.role === "junk")) {
-        if (!confirm(`Delete ${uids.length} conversation(s) forever?`)) return;
+        if (!(await ask("Delete forever?", `${uids.length} conversation${uids.length > 1 ? "s" : ""} will be deleted forever. This can't be undone.`, "Delete forever", true))) return;
         S.list = S.list.filter((m) => !uids.includes(m.uid)); uids.forEach((u) => S.selected.delete(u)); renderList();
         try { await api("/api/messages/delete", { method: "POST", body: { folder: S.folder, uids } }); snack("Deleted forever"); loadFolders(); loadQuota(); } catch (e) { fail(e); loadList(); }
         return;
@@ -480,7 +663,19 @@ async function bulkAction(act, uids, anchor) {
     case "read": return setSeen(uids, true);
     case "unread": return setSeen(uids, false);
     case "move": return folderPicker(anchor || $("#bulk-actions"), (dest) => moveMessages(uids, dest, `Moved to ${dest}`));
+    case "category": return popover(anchor || $("#bulk-actions"), CATS.filter(([k]) => k !== S.category).map(([k, ic, label]) => ({ icon: ic, label: `Move to ${label}`, onClick: () => moveToTab(uids, k, label) })));
   }
+}
+
+async function moveToTab(uids, cat, label) {
+  const msgs = S.list.filter((m) => uids.includes(m.uid));
+  const senders = [...new Set(msgs.map((m) => m.from[0]?.email).filter(Boolean))];
+  S.list = S.list.filter((m) => !uids.includes(m.uid)); uids.forEach((u) => S.selected.delete(u)); renderList();
+  try {
+    await api("/api/messages/category", { method: "POST", body: { folder: S.folder, uids, category: cat, senders, learn: true } });
+    snack(`Moved to ${label}. Future messages from ${senders.length === 1 ? senders[0] : "these senders"} will go there too.`);
+    loadList(false);
+  } catch (e) { fail(e); loadList(); }
 }
 
 // ---------------------------------------------------------------- message view
@@ -498,10 +693,73 @@ async function openMessage(uid) {
     if (seq !== msgSeq) return;
     S.current = m;
     const li = S.list.find((x) => x.uid === uid);
+    if (m.spam_check && !S.spamOk.has(uid)) { if (li) li.message_id = m.message_id; renderSpamGate(m, li); return; }
     if (li) { if (!li.seen) { li.seen = true; loadFolders().catch(() => {}); } li.message_id = m.message_id; }
     renderMessage(m);
   } catch (e) { if (seq === msgSeq) sc.innerHTML = `<div class="empty">${icon("error")}<p>${esc(e.message)}</p></div>`; fail(e); }
 }
+// ---------------------------------------------------------------- Spam: warn before showing anything
+function renderSpamGate(m, li) {
+  const c = m.spam_check, sc = $("#msg-scroll"), fromP = m.from[0] || {};
+  const reasons = [`<li>${icon("report")}<div><b>This message was marked as spam.</b> Spam often pretends to be a bank, a delivery company or someone you know.</div></li>`];
+  if (c.spoofed_name) reasons.push(`<li>${icon("warning")}<div><b>Misleading sender.</b> ${esc(c.spoofed_name)}.</div></li>`);
+  if (c.links) reasons.push(`<li>${icon("link")}<div><b>${c.links} link${c.links > 1 ? "s" : ""}</b> to ${c.link_domains.map((d) => `<code>${esc(d)}</code>`).join(", ")}${c.link_domains.length < c.links ? " …" : ""}.
+    Don't enter passwords or payment details on a page opened from this message.</div></li>`);
+  if (c.risky_attachments.length) reasons.push(`<li>${icon("error")}<div><b>Restricted attachment${c.risky_attachments.length > 1 ? "s" : ""}</b> (can't be downloaded from Spam):
+    ${c.risky_attachments.map((a) => `<div class="sg-file"><code>${esc(a.filename)}</code> · ${esc(a.reason)}</div>`).join("")}</div></li>`);
+  else if (c.attachments) reasons.push(`<li>${icon("attach_file")}<div><b>${c.attachments} attachment${c.attachments > 1 ? "s" : ""}.</b> Only open files you were expecting.</div></li>`);
+  const danger = c.links || c.risky_attachments.length || c.spoofed_name;
+  sc.innerHTML = "";
+  const el = h(`<div class="spam-gate ${danger ? "danger" : ""}">
+    <div class="sg-head">${icon("warning")}<div><h2>Be careful with this message</h2>
+      <p class="muted">From <b>${esc(fromP.name || fromP.email || "unknown sender")}</b> ${fromP.name ? `&lt;${esc(fromP.email)}&gt;` : ""} · ${esc(m.subject || "(no subject)")}</p></div></div>
+    <ul class="sg-reasons">${reasons.join("")}</ul>
+    <div class="sg-actions">
+      <button class="btn outline" data-g="back">${icon("arrow_back")} Back to Spam</button>
+      <button class="btn outline" data-g="notspam">${icon("inbox")} Not spam</button>
+      <button class="btn ${danger ? "danger" : "primary"}" data-g="show">Show message anyway</button>
+    </div></div>`);
+  sc.append(el);
+  el.addEventListener("click", async (e) => {
+    const g = e.target.closest("[data-g]")?.dataset.g; if (!g) return;
+    if (g === "back") location.hash = listHash();
+    else if (g === "notspam") msgAction("notspam");
+    else if (g === "show") {
+      S.spamOk.add(m.uid);
+      if (li && !li.seen) li.seen = true;
+      api("/api/messages/flags", { method: "POST", body: { folder: S.folder, uids: [m.uid], flag: "seen", value: true } }).then(() => loadFolders()).catch(() => {});
+      renderMessage(m);
+    }
+  });
+}
+function confirmSpamLink(href) {
+  let host = href; try { host = new URL(href).host; } catch (e) {}
+  modal({ title: "Open a link from a spam message?", body: `<p>This link goes to <b>${esc(host)}</b>.</p>
+      <p class="muted" style="font-size:13px;word-break:break-all">${esc(href.slice(0, 300))}</p>
+      <p style="font-size:13px">Spam links often lead to fake sign-in pages. Never enter your password or card details there.</p>`,
+    buttons: [{ label: "Cancel" }, { label: "Open link", cls: "danger", onClick: () => { window.open(href, "_blank", "noopener,noreferrer"); } }] });
+}
+
+// Summary card: the key sentences and facts the assistant found (computed on the server, no AI service).
+const FACT_ICON = { date: "calendar", time: "calendar", deadline: "warning", amount: "label", code: "lock", reference: "code" };
+function summaryCard(a) {
+  if (!a) return "";
+  const worth = a.words >= 80 || a.facts.length >= 2 || a.questions.length;
+  if (!worth || (!a.summary.length && !a.facts.length)) return "";
+  let open = true; try { open = localStorage.getItem("zm.summary") !== "closed"; } catch (e) {}
+  const facts = a.facts.filter((f) => f.type !== "time" || !a.facts.some((d) => d.type === "deadline" && d.text.includes(f.text)));
+  return `<details class="ai-card" ${open ? "open" : ""}><summary>${icon("notes")}<b>Summary</b>
+      <span class="muted">${a.reading_minutes ? `${a.reading_minutes} min read` : ""}${a.action_needed ? ' · <span class="ai-act">Needs your reply or action</span>' : ""}</span></summary>
+    ${a.summary.length ? `<ul class="ai-sum">${a.summary.map((s) => `<li>${esc(s)}</li>`).join("")}</ul>` : ""}
+    ${a.questions.length ? `<div class="ai-q"><b>Asked of you</b>${a.questions.map((q) => `<div>${esc(q)}</div>`).join("")}</div>` : ""}
+    ${facts.length || a.attachments.length || a.links ? `<div class="ai-facts">${facts.map((f) => `<span class="ai-fact ${f.type}" title="${esc(f.type)}">${icon(FACT_ICON[f.type] || "label")}${esc(f.text)}</span>`).join("")}
+      ${a.attachments.map((n) => `<span class="ai-fact">${icon("attach_file")}${esc(n)}</span>`).join("")}
+      ${a.links ? `<span class="ai-fact">${icon("link")}${a.links} link${a.links > 1 ? "s" : ""}</span>` : ""}</div>` : ""}
+  </details>`;
+}
+document.addEventListener("toggle", (e) => {
+  if (e.target.classList?.contains("ai-card")) try { localStorage.setItem("zm.summary", e.target.open ? "open" : "closed"); } catch (err) {}
+}, true);
 function renderMessage(m, images = false) {
   const sc = $("#msg-scroll");
   const f = folderByKey(S.folderKey);
@@ -534,6 +792,8 @@ function renderMessage(m, images = false) {
           <button class="icon-btn" data-x="more" title="More"><i data-icon="more_vert"></i></button>
         </div>
       </div>
+      ${m.spam_check ? `<div class="spam-banner">${icon("warning")} This message is in Spam. Links ask before opening${m.spam_check.risky_attachments.length ? " and restricted attachments are blocked" : ""}.</div>` : ""}
+      ${summaryCard(m.assistant)}
       ${m.blocked_images && !images ? `<div class="img-banner">${icon("image")} Images in this message are hidden to protect your privacy. <button class="btn text" data-x="images">Display images below</button></div>` : ""}
       <div class="msg-body"><iframe sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox" title="Message body" referrerpolicy="no-referrer"></iframe></div>
       ${m.attachments.length ? `<div class="attachments"><h4>${m.attachments.length} attachment${m.attachments.length > 1 ? "s" : ""}${S.config.antivirus ? ' <span class="muted" style="font-weight:400;font-size:12px">· scanned by antivirus</span>' : ""}</h4><div class="att-grid"></div></div>` : ""}
@@ -558,13 +818,25 @@ function renderMessage(m, images = false) {
     try {
       const d = frame.contentDocument;
       $$("img", d).forEach((i) => i.addEventListener("load", fit));
+      if (m.spam_check) d.addEventListener("click", (ev) => {
+        const a = ev.target.closest && ev.target.closest("a[href]"); if (!a) return;
+        ev.preventDefault(); confirmSpamLink(a.href);
+      }, true);
       new ResizeObserver(fit).observe(d.body);
     } catch (e) {}
   });
   if (dark) frame.style.borderRadius = "8px";
   // attachments
   const grid = $(".att-grid", el);
-  if (grid) for (const a of m.attachments) grid.append(attachmentCard(m, a));
+  const riskyNames = new Set((m.spam_check?.risky_attachments || []).map((r) => r.filename));
+  if (grid) for (const a of m.attachments) {
+    const card = attachmentCard(m, a);
+    if (riskyNames.has(a.filename)) {          // restricted file in Spam: not downloadable
+      card.classList.add("att-blocked"); card.removeAttribute("href"); card.title = "Blocked: restricted file in a spam message";
+      card.addEventListener("click", (ev) => { ev.preventDefault(); ev.stopPropagation(); snack(`"${a.filename}" can't be downloaded from Spam`); }, true);
+    }
+    grid.append(card);
+  }
   el.addEventListener("click", (e) => {
     const x = e.target.closest("[data-x]"); if (!x) return;
     const a = x.dataset.x;
@@ -803,9 +1075,15 @@ async function deepCheck(c, a) {
 // ---------------------------------------------------------------- composer
 const composers = [];
 function quoteHeader(m) { return `On ${new Date(m.date).toLocaleString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" })}, ${esc(fullAddr(m.from[0] || { email: "" }))} wrote:`; }
+// The active signature as HTML: either the plain-text one or the HTML one, never both.
+function signatureHtml(st = S.settings) {
+  if (st.signature_type === "html") return st.signature || "";
+  return st.signature_text ? esc(st.signature_text).replace(/\n/g, "<br>") : "";
+}
 function openComposer(opts = {}) {
   const { mode = "new", msg } = opts;
-  const sig = S.settings.signature ? `<br><br><div class="zoltis-sig">-- <br>${S.settings.signature}</div>` : "";
+  const sigH = signatureHtml();
+  const sig = sigH ? `<br><br><div class="zoltis-sig">-- <br>${sigH}</div>` : "";
   const c = { id: Math.random().toString(36).slice(2), to: [], cc: [], bcc: [], subject: "", html: "", attachments: [], fwdAtts: [], draftUid: opts.draftUid || null, dirty: false, mode };
   const me = S.me.email.toLowerCase();
   if (msg && (mode === "reply" || mode === "replyall")) {
@@ -842,8 +1120,8 @@ function openComposer(opts = {}) {
         <div class="toggles"><span data-c="showcc">Cc</span><span data-c="showbcc">Bcc</span></div></div>
       <div class="c-row hidden" data-field="cc"><label>Cc</label><div class="chips"><input class="plain" autocomplete="off" aria-label="Cc"></div></div>
       <div class="c-row hidden" data-field="bcc"><label>Bcc</label><div class="chips"><input class="plain" autocomplete="off" aria-label="Bcc"></div></div>
-      <div class="c-row"><input class="plain subj" placeholder="Subject" aria-label="Subject" value="${esc(c.subject)}"></div>
-      <div class="c-editor" contenteditable="true" data-placeholder="" role="textbox" aria-multiline="true" aria-label="Message body"></div>
+      <div class="c-row"><input class="plain subj" placeholder="Subject" aria-label="Subject" spellcheck="true" value="${esc(c.subject)}"></div>
+      <div class="c-editor" contenteditable="true" spellcheck="true" lang="${esc(navigator.language || "en")}" data-placeholder="" role="textbox" aria-multiline="true" aria-label="Message body"></div>
       <div class="c-atts"></div>
     </div>
     <div class="fmt-bar hidden">
@@ -969,7 +1247,8 @@ function removeComposer(c) {
 }
 function hasContent(c) {
   const text = $(".c-editor", c.el).innerText.replace(/\s|--/g, "");
-  const sigText = S.settings.signature ? h(`<div>${S.settings.signature}</div>`).innerText.replace(/\s/g, "") : "";
+  const sigH = signatureHtml();
+  const sigText = sigH ? h(`<div>${sigH}</div>`).innerText.replace(/\s/g, "") : "";
   return c.to.length || c.cc.length || c.bcc.length || c.subject || c.attachments.length || (text && text !== sigText);
 }
 async function closeComposer(c, silent) {
@@ -1017,9 +1296,9 @@ async function sendComposer(c) {
   if (!c.to.length && !c.cc.length && !c.bcc.length) { snack("Please specify at least one recipient."); $('[data-field="to"] input', c.el).focus(); return; }
   const bad = [...c.to, ...c.cc, ...c.bcc].filter((p) => !/^[^@\s<>"]+@[^@\s<>"]+\.[^@\s<>"]+$/.test(p.email));
   if (bad.length) { snack(`The address "${bad[0].email}" is not valid. Please fix it.`); return; }
-  if (!c.subject && !confirm("Send this message without a subject?")) return;
+  if (!c.subject && !(await ask("No subject", "Send this message without a subject?", "Send"))) return;
   if (c.attachments.some((a) => a.reading || a.checking)) { snack("Please wait, attachments are still being checked…"); return; }
-  if (/\battach(ed|ment|ing)\b/i.test(h(`<div>${c.html.split('class="zoltis-quote"')[0]}</div>`)?.innerText || "") && !c.attachments.length && !c.fwdAtts.length && !confirm("You mentioned an attachment but none is attached. Send anyway?")) return;
+  if (/\battach(ed|ment|ing)\b/i.test(h(`<div>${c.html.split('class="zoltis-quote"')[0]}</div>`)?.innerText || "") && !c.attachments.length && !c.fwdAtts.length && !(await ask("Forgot an attachment?", "You mentioned an attachment, but nothing is attached.", "Send anyway"))) return;
   const body = payload(c);
   c.el.classList.add("hidden");
   const delay = Math.max(0, +S.settings.undo_send_seconds || 0) * 1000;
@@ -1137,6 +1416,206 @@ $("#compose-btn").onclick = () => openComposer();
 $("#compose-fab").onclick = () => openComposer();
 window.addEventListener("beforeunload", (e) => { if (composers.some((c) => c.dirty && hasContent(c))) { e.preventDefault(); e.returnValue = ""; } });
 
+// ---------------------------------------------------------------- 2-step verification & app passwords
+function qrSvg(text) {
+  const q = qrcode(0, "M"); q.addData(text); q.make();
+  const n = q.getModuleCount(), pad = 4;
+  let d = "";
+  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (q.isDark(r, c)) d += `M${c + pad},${r + pad}h1v1h-1z`;
+  return `<svg class="qr" viewBox="0 0 ${n + pad * 2} ${n + pad * 2}" width="200" height="200" role="img" aria-label="QR code" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="#fff"/><path d="${d}" fill="#000"/></svg>`;
+}
+function copyBtn(text) { return `<button type="button" class="icon-btn sm" data-copy="${esc(text)}" title="Copy" aria-label="Copy">${icon("copy")}</button>`; }
+function wireCopy(root) {
+  $$("[data-copy]", root).forEach((b) => (b.onclick = async () => {
+    try { await navigator.clipboard.writeText(b.dataset.copy); snack("Copied"); } catch (e) { snack("Select the text and copy it manually"); }
+  }));
+}
+function askPassword(title, text, action) {
+  return new Promise((resolve) => {
+    let done = false;
+    const md = modal({ title, body: `<p>${text}</p><label class="muted">Your password</label><input class="txt" type="password" autocomplete="current-password" style="margin-top:6px">`,
+      buttons: [{ label: "Cancel" }, { label: action, cls: "primary", onClick: (m) => { done = true; resolve($("input", m).value); } }],
+      onClose: () => !done && resolve(null) });
+    $("input", md.el).addEventListener("keydown", (e) => { if (e.key === "Enter") $(".btn.primary", md.el).click(); });
+  });
+}
+function showSecretOnce(title, intro, secretHtml, outro = "") {
+  const md = modal({ title, wide: true, body: `<p>${intro}</p>${secretHtml}${outro ? `<p class="muted" style="font-size:13px">${outro}</p>` : ""}`,
+    buttons: [{ label: "Done", cls: "primary" }] });
+  wireCopy(md.el);
+  return md;
+}
+function recoveryHtml(codes) {
+  return `<div class="codes">${codes.map((c) => `<code>${esc(c)}</code>`).join("")}</div>
+    <div style="display:flex;gap:8px;margin-top:10px">${copyBtn(codes.join("\n"))}<span class="muted" style="font-size:13px;align-self:center">Copy all</span></div>`;
+}
+async function renderAccountSecurity(box) {
+  let st;
+  try { st = await api("/api/account/security"); } catch (e) { box.innerHTML = ""; return; }
+  if (!st.available) { box.innerHTML = ""; return; }
+  const when = st.app_password_created ? new Date(st.app_password_created * 1000).toLocaleDateString() : "";
+  box.innerHTML = `
+    <div class="set-row"><b>2-Step Verification</b><div>
+      ${st.twofa ? `<span class="st-pass">${icon("shield")} On</span>
+        <div style="margin-top:6px">Signing in to webmail asks for a code from your authenticator app. ${st.recovery_left} recovery code${st.recovery_left === 1 ? "" : "s"} left.</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button class="btn outline" id="sec-rc">New recovery codes</button><button class="btn text" id="sec-off">Turn off</button></div>`
+      : `<span class="st-warn">${icon("warning")} Off</span>
+        <div style="margin-top:6px">Protect your account with a code from an authenticator app (Google Authenticator, Microsoft Authenticator, Authy, 1Password…) in addition to your password.</div>
+        <div style="margin-top:10px"><button class="btn primary" id="sec-on">${icon("shield")} Turn on 2-step verification</button></div>`}
+    </div></div>
+    <div class="set-row"><b>App password</b><div>
+      <div>${st.twofa ? "With 2-step verification on, mail apps (iPhone Mail, Outlook, Thunderbird) can't use your normal password. They sign in with an app password instead."
+        : "Optional: a separate password for mail apps (iPhone Mail, Outlook, Thunderbird), so your main password isn't stored on every device."}</div>
+      ${st.app_password ? `<div style="margin-top:6px"><span class="st-pass">${icon("check")} Created ${esc(when)}</span></div>` : ""}
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button class="btn outline" id="sec-app">${st.app_password ? "Replace app password" : "Create app password"}</button>
+      ${st.app_password ? `<button class="btn text" id="sec-app-del">Delete</button>` : ""}</div>
+      ${st.app_password ? `<div class="muted" style="font-size:12px;margin-top:6px">Replacing or deleting it signs out every mail app that uses it.</div>` : ""}
+    </div></div>`;
+  const again = () => renderAccountSecurity(box);
+  const on = $("#sec-on", box); if (on) on.onclick = () => setupTwoFactor(again);
+  const off = $("#sec-off", box); if (off) off.onclick = async () => {
+    const pw = await askPassword("Turn off 2-step verification", "Your account will be protected by your password only. Mail apps keep working with your app password.", "Turn off");
+    if (pw === null) return;
+    try { await api("/api/account/2fa/disable", { method: "POST", body: { password: pw } }); snack("2-step verification is off"); again(); } catch (e) { snack(e.message); }
+  };
+  const rc = $("#sec-rc", box); if (rc) rc.onclick = async () => {
+    const pw = await askPassword("New recovery codes", "Your old recovery codes will stop working.", "Create new codes");
+    if (pw === null) return;
+    try { const r = await api("/api/account/2fa/recovery", { method: "POST", body: { password: pw } });
+      showSecretOnce("Your new recovery codes", "Each code works once, if you lose your phone. Save them somewhere safe (a password manager, or print them).", recoveryHtml(r.recovery_codes)); again();
+    } catch (e) { snack(e.message); }
+  };
+  $("#sec-app", box).onclick = () => createAppPassword(again);
+  const del = $("#sec-app-del", box); if (del) del.onclick = async () => {
+    if (!(await ask("Delete the app password?", "Mail apps using it will stop syncing until you sign them in again.", "Delete", true))) return;
+    try { await api("/api/account/app-password/delete", { method: "POST" }); snack("App password deleted"); again(); } catch (e) { snack(e.message); }
+  };
+}
+async function createAppPassword(done) {
+  const pw = await askPassword("App password", "Create a password for your mail apps. If you already have one, it is replaced and apps using it must sign in again.", "Create");
+  if (pw === null) return;
+  try {
+    const r = await api("/api/account/app-password", { method: "POST", body: { password: pw } });
+    showSecretOnce("Your app password", "Enter this in iPhone Mail, Outlook or Thunderbird as the password for your account. Use your full email address as the username.",
+      `<div class="secret-box"><code class="big">${esc(r.app_password)}</code>${copyBtn(r.app_password)}</div>`,
+      "It is shown only once. You don't need to remember it: you can always create a new one here. Use the same app password on all your devices.");
+    done && done();
+  } catch (e) { snack(e.message); }
+}
+async function setupTwoFactor(done) {
+  const pw = await askPassword("Turn on 2-step verification", "Confirm it's you to continue.", "Continue");
+  if (pw === null) return;
+  let r;
+  try { r = await api("/api/account/2fa/start", { method: "POST", body: { password: pw } }); } catch (e) { snack(e.message); return; }
+  const pretty = r.secret.replace(/(.{4})/g, "$1 ").trim();
+  const body = h(`<div>
+    <ol class="steps">
+      <li>Install an authenticator app on your phone, such as Google Authenticator, Microsoft Authenticator or Authy.</li>
+      <li>In the app, tap <b>+</b> and scan this QR code:
+        <div class="qr-wrap">${qrSvg(r.uri)}</div>
+        <details><summary style="cursor:pointer;color:var(--primary)">Can't scan it? Enter this key instead</summary>
+          <div class="secret-box"><code>${esc(pretty)}</code>${copyBtn(r.secret)}</div><div class="muted" style="font-size:12px">Time-based, 6 digits.</div></details></li>
+      <li>Enter the 6-digit code the app shows:
+        <input class="txt" id="tf-code" inputmode="numeric" autocomplete="one-time-code" maxlength="8" placeholder="123456" style="max-width:160px;margin-top:8px;font-size:18px;letter-spacing:2px"></li>
+    </ol>
+    <div class="callout">${icon("warning")}<div>After this, iPhone Mail, Outlook and Thunderbird need an <b>app password</b> instead of your normal password. You can create one in the next step.</div></div>
+  </div>`);
+  wireCopy(body);
+  const md = modal({ title: "Turn on 2-step verification", wide: true, body, buttons: [{ label: "Cancel" }, { label: "Turn on", cls: "primary", onClick: async (m) => {
+    try {
+      const x = await api("/api/account/2fa/enable", { method: "POST", body: { code: $("#tf-code", m).value } });
+      setTimeout(() => {
+        const rc = showSecretOnce("2-step verification is on", "Save these recovery codes. If you lose your phone, each code lets you sign in once.", recoveryHtml(x.recovery_codes),
+          "Next: create an app password for your mail apps (Settings → Security → App password).");
+        const btn = h(`<button class="btn outline">${icon("smartphone")} Create app password now</button>`);
+        btn.onclick = () => { rc.close(); createAppPassword(done); };
+        $(".m-body", rc.el).append(btn);
+      }, 0);
+      done && done();
+    } catch (e) { snack(e.message); return false; }
+  } }] });
+  $("#tf-code", md.el).addEventListener("keydown", (e) => { if (e.key === "Enter") $(".btn.primary", md.el).click(); });
+  setTimeout(() => $("#tf-code", md.el).focus(), 50);
+}
+
+// ---------------------------------------------------------------- mail apps (iPhone, Outlook, Thunderbird)
+async function renderMailApps(tb) {
+  tb.innerHTML = `<div class="loading-bar"></div>`;
+  let m;
+  try { m = await api("/api/account/mail-setup"); } catch (e) { tb.innerHTML = `<p class="st-fail">${esc(e.message)}</p>`; return; }
+  const I = m.imap, O = m.smtp;
+  const pwWord = m.twofa ? "your <b>app password</b> (not your normal password)" : "your email password";
+  const v = (x) => `<code>${esc(x)}</code>`;
+  const smtpSec = `${O.port} · ${esc(O.security)}${O.alt_port ? ` <span class="muted">(or ${O.alt_port} · ${esc(O.alt_security)})</span>` : ""}`;
+  const apps = {
+    iphone: ["iPhone / iPad Mail", `
+      ${m.profile ? `<p><b>Quickest:</b> open this page on your iPhone or iPad in <b>Safari</b> and tap the button. Then open the <b>Settings</b> app, tap <b>Profile Downloaded</b> → <b>Install</b>, and enter ${pwWord} when asked.</p>
+      <p><a class="btn primary" href="/api/account/apple-profile">${icon("download")} Download iPhone / iPad setup profile</a></p>
+      <p class="muted" style="font-size:13px">Or set it up by hand:</p>` : ""}
+      <ol class="steps">
+        <li>Open <b>Settings</b> → <b>Apps</b> → <b>Mail</b> → <b>Mail Accounts</b> → <b>Add Account</b> (older iOS: <b>Settings → Mail → Accounts</b>).</li>
+        <li>Tap <b>Other</b> → <b>Add Mail Account</b>. Enter your name, ${v(m.email)}, ${pwWord}, then tap <b>Next</b>.</li>
+        <li>Choose <b>IMAP</b>. Under <b>Incoming Mail Server</b>: Host Name ${v(I.host)}, User Name ${v(m.username)}, Password: ${pwWord}.</li>
+        <li>Under <b>Outgoing Mail Server</b>: Host Name ${v(O.host)}, User Name ${v(m.username)}, the same password. Tap <b>Next</b>, then <b>Save</b>.</li>
+      </ol>`],
+    mac: ["Mac Mail", `
+      <ol class="steps">
+        <li>Open <b>Mail</b> → <b>Mail</b> menu → <b>Add Account…</b> → <b>Other Mail Account…</b> → <b>Continue</b>.</li>
+        <li>Enter your name, ${v(m.email)} and ${pwWord}, then click <b>Sign In</b>.</li>
+        <li>When it asks for server details: Account Type <b>IMAP</b>, Incoming Mail Server ${v(I.host)}, Outgoing Mail Server ${v(O.host)}, User Name ${v(m.username)}. Click <b>Sign In</b> and choose <b>Mail</b>.</li>
+      </ol>
+      ${m.profile ? `<p class="muted" style="font-size:13px">You can also download the <a href="/api/account/apple-profile">setup profile</a>, double-click it and install it in <b>System Settings → General → Device Management</b>.</p>` : ""}`],
+    outlookm: ["Outlook for iPhone / Android", `
+      <ol class="steps">
+        <li>Open <b>Outlook</b>. New install: tap <b>Add account</b>. Already using Outlook: tap your profile picture → <b>Settings</b> (gear) → <b>Add mail account</b> → <b>Add an email account</b>.</li>
+        <li>Enter ${v(m.email)} and tap <b>Continue</b>. If Outlook offers Microsoft or Google, tap <b>Setup account manually</b> (or <b>Change account provider</b>) and choose <b>IMAP</b>.</li>
+        <li>Turn on <b>Advanced settings</b>. Incoming (IMAP): server ${v(I.host)}, port ${I.port}, security ${esc(I.security)}, username ${v(m.username)}, ${pwWord}.</li>
+        <li>Outgoing (SMTP): server ${v(O.host)}, port ${O.port}, security ${esc(O.security)}, username ${v(m.username)}, the same password. Tap the <b>✓</b> / <b>Sign in</b>.</li>
+      </ol>`],
+    outlookd: ["Outlook for Windows / Mac", `
+      <ol class="steps">
+        <li><b>New Outlook for Windows / Outlook for Mac:</b> <b>Settings</b> → <b>Accounts</b> → <b>Add account</b>. <b>Classic Outlook:</b> <b>File</b> → <b>Add Account</b>.</li>
+        <li>Enter ${v(m.email)}. Classic Outlook: open <b>Advanced options</b> → tick <b>Let me set up my account manually</b> → <b>Connect</b>.</li>
+        <li>Choose <b>IMAP</b>. Incoming: ${v(I.host)}, port ${I.port}, encryption ${esc(I.security)}. Outgoing: ${v(O.host)}, port ${O.port}, encryption ${esc(O.security)}.</li>
+        <li>Username ${v(m.username)}, password: ${pwWord}. Click <b>Connect</b> / <b>Continue</b>.</li>
+      </ol>`],
+    tbird: ["Thunderbird (Windows / Mac / Linux)", `
+      <ol class="steps">
+        <li>Click the <b>☰</b> menu → <b>Account Settings</b> → <b>Account Actions</b> → <b>Add Mail Account…</b> (first start: the setup opens by itself).</li>
+        <li>Enter your name, ${v(m.email)} and ${pwWord}. Click <b>Continue</b>.</li>
+        <li>If Thunderbird doesn't find the settings, click <b>Configure manually</b>: Incoming <b>IMAP</b> ${v(I.host)}, port ${I.port}, ${esc(I.security)}, Normal password. Outgoing <b>SMTP</b> ${v(O.host)}, port ${O.port}, ${esc(O.security)}, Normal password. Username ${v(m.username)} for both.</li>
+        <li>Click <b>Re-test</b>, then <b>Done</b>.</li>
+      </ol>`],
+    tbirdm: ["Thunderbird for Android", `
+      <ol class="steps">
+        <li>Open <b>Thunderbird</b> (formerly K-9 Mail) → <b>Add account</b> (or ☰ → <b>Settings</b> → <b>Add account</b>).</li>
+        <li>Enter ${v(m.email)} → <b>Next</b>. If it can't find the settings, choose <b>Manual setup</b> → <b>IMAP</b>.</li>
+        <li>Incoming: server ${v(I.host)}, security ${esc(I.security)}, port ${I.port}, username ${v(m.username)}, ${pwWord}.</li>
+        <li>Outgoing: server ${v(O.host)}, security ${esc(O.security)}, port ${O.port}, same username and password. Tap <b>Next</b> until done.</li>
+      </ol>`],
+  };
+  const guess = /iPhone|iPad/.test(navigator.userAgent) ? "iphone" : /Android/.test(navigator.userAgent) ? "outlookm" : /Macintosh/.test(navigator.userAgent) ? "mac" : "outlookd";
+  tb.innerHTML = `
+    ${m.twofa ? `<div class="callout">${icon("shield")}<div>2-step verification is on, so mail apps sign in with an <b>app password</b>, not your normal password.
+      ${m.app_password ? "Use the app password you created (or create a new one if you don't have it)." : "You don't have one yet."}
+      <div style="margin-top:8px"><button class="btn outline" id="ma-app">${m.app_password ? "Create a new app password" : "Create app password"}</button></div></div></div>` : ""}
+    <div class="set-row"><b>Your settings</b><div><table class="srv-table">
+      <tr><td>Email address</td><td>${v(m.email)} ${copyBtn(m.email)}</td></tr>
+      <tr><td>Username</td><td>${v(m.username)} <span class="muted">(full email address)</span></td></tr>
+      <tr><td>Password</td><td>${pwWord}</td></tr>
+      <tr><td>Incoming (IMAP)</td><td>${v(I.host)} ${copyBtn(I.host)}<br><span class="muted">Port ${I.port} · ${esc(I.security)}</span></td></tr>
+      <tr><td>Outgoing (SMTP)</td><td>${v(O.host)} ${copyBtn(O.host)}<br><span class="muted">Port ${smtpSec} · password required</span></td></tr>
+    </table></div></div>
+    <div class="set-row"><b>Step by step</b><div>
+      <select id="ma-pick" style="width:auto;margin-bottom:8px">${Object.entries(apps).map(([k, [l]]) => `<option value="${k}" ${k === guess ? "selected" : ""}>${esc(l)}</option>`).join("")}</select>
+      <div id="ma-steps"></div>
+    </div></div>`;
+  const show = () => { const st = $("#ma-steps", tb); st.innerHTML = apps[$("#ma-pick", tb).value][1]; hydrateIcons(st); };
+  $("#ma-pick", tb).onchange = show; show();
+  wireCopy(tb);
+  const ab = $("#ma-app", tb); if (ab) ab.onclick = () => createAppPassword(() => renderMailApps(tb));
+}
+
 // ---------------------------------------------------------------- settings
 function openSettings(tab = "general") {
   const s = { ...S.settings };
@@ -1145,6 +1624,7 @@ function openSettings(tab = "general") {
       <button class="tab" data-t="general">General</button>
       <button class="tab" data-t="deliver">Deliverability</button>
       <button class="tab" data-t="security">Security</button>
+      <button class="tab" data-t="apps">Mail apps</button>
       <button class="tab" data-t="about">About</button>
     </div><div class="t-body"></div></div>`);
   const tb = $(".t-body", body);
@@ -1153,14 +1633,39 @@ function openSettings(tab = "general") {
     general: () => {
       tb.innerHTML = `
         <div class="set-row"><b>Your name</b><input class="txt" data-s="display_name" value="${esc(s.display_name)}" placeholder="${esc(S.me.email.split("@")[0])}"></div>
-        <div class="set-row"><b>Theme</b>${radios("theme", [["system", "Device default"], ["light", "Light"], ["dark", "Dark"]])}</div>
+        <div class="set-row"><b>Theme</b>${radios("theme", [["light", "Light (default)"], ["dark", "Dark"], ["system", "Same as my device"]])}</div>
         <div class="set-row"><b>Density</b>${radios("density", [["default", "Default"], ["comfortable", "Comfortable"], ["compact", "Compact"]])}</div>
         <div class="set-row"><b>Maximum page size</b><div>Show <select data-s="page_size" style="width:auto">${[25, 50, 100].map((n) => `<option ${s.page_size == n ? "selected" : ""}>${n}</option>`).join("")}</select> conversations per page</div></div>
         <div class="set-row"><b>Images</b>${radios("load_images", [["always", "Always display external images"], ["ask", "Ask before displaying external images (protects against tracking)"]])}</div>
+        <div class="set-row"><b>Inbox tabs</b>${radios("inbox_tabs", [["true", "Sort the inbox into Primary, Promotions, Social, Updates and Forums"], ["false", "One inbox, no tabs"]])}</div>
+        <div class="set-row"><b>Summaries</b>${radios("smart_summary", [["true", "Show a short summary, dates, amounts and questions above long messages"], ["false", "Don't show summaries"]])}</div>
         <div class="set-row"><b>Undo send</b><div>Send cancellation period: <select data-s="undo_send_seconds" style="width:auto">${[0, 5, 10, 20, 30].map((n) => `<option value="${n}" ${s.undo_send_seconds == n ? "selected" : ""}>${n}</option>`).join("")}</select> seconds</div></div>
         ${S.me.mail_mode === "bundled" ? `<div class="set-row"><b>Password</b><div><button class="btn outline" type="button" id="chpw">Change password</button></div></div>` : ""}
-        <div class="set-row"><b>Signature</b><div><div class="sig-editor" contenteditable="true">${s.signature || ""}</div><div class="muted" style="font-size:12px;margin-top:4px">Appended at the end of all outgoing messages.</div></div></div>`;
+        <div class="set-row"><b>Signature</b><div class="sig-box">
+          <div class="sig-tabs" role="tablist">
+            <button type="button" class="sig-tab" role="tab" data-sigt="text">Plain text</button>
+            <button type="button" class="sig-tab" role="tab" data-sigt="html">HTML</button>
+          </div>
+          <div class="sig-pane" data-pane="text"><textarea class="txt sig-text" rows="5" spellcheck="true" placeholder="Jane Doe&#10;Sales Manager · Acme Ltd&#10;+971 4 000 0000">${esc(s.signature_text || "")}</textarea></div>
+          <div class="sig-pane" data-pane="html">
+            <textarea class="txt sig-html" rows="7" spellcheck="false" placeholder="<p><b>Jane Doe</b><br>Sales Manager · Acme Ltd</p>">${esc(s.signature || "")}</textarea>
+            <div class="sig-label">Preview</div><iframe class="sig-preview" sandbox title="Signature preview"></iframe>
+          </div>
+          <div class="muted sig-note"></div></div></div>`;
       const cp = $("#chpw", tb); if (cp) cp.onclick = changePassword;
+      // Signature: one type at a time. The selected tab is the one added to messages; the other is kept but unused.
+      const setSig = (t) => {
+        tb.dataset.sigt = t;
+        $$(".sig-tab", tb).forEach((b) => { b.classList.toggle("on", b.dataset.sigt === t); b.setAttribute("aria-selected", b.dataset.sigt === t); });
+        $$(".sig-pane", tb).forEach((p) => p.classList.toggle("hidden", p.dataset.pane !== t));
+        $(".sig-note", tb).textContent = t === "html"
+          ? "Your HTML signature is added to every message. Scripts and forms are removed when you save. The plain-text signature isn't used."
+          : "Your plain-text signature is added to every message. The HTML signature isn't used.";
+      };
+      const preview = () => { const f = $(".sig-preview", tb); if (f) f.srcdoc = `<!DOCTYPE html><meta charset="utf-8"><style>body{margin:8px;font:14px Arial,sans-serif;color:#222}</style>${$(".sig-html", tb).value}`; };
+      $$(".sig-tab", tb).forEach((b) => (b.onclick = () => setSig(b.dataset.sigt)));
+      $(".sig-html", tb).addEventListener("input", preview);
+      setSig(s.signature_type === "html" ? "html" : "text"); preview();
     },
     deliver: async () => {
       const dom = S.me.email.split("@")[1];
@@ -1180,7 +1685,7 @@ function openSettings(tab = "general") {
       tb.innerHTML = `<div class="loading-bar"></div>`;
       let av = {};
       try { av = await api("/api/antivirus"); } catch (e) {}
-      tb.innerHTML = `
+      tb.innerHTML = `<div id="acct-sec"></div>
         <div class="set-row"><b>Antivirus (ClamAV)</b><div>${!av.enabled ? `<span class="st-warn">${icon("warning")} Disabled by the administrator</span>` :
           av.online ? `<span class="st-pass">${icon("shield")} Active</span><div class="muted" style="font-size:12px;margin-top:4px">${esc(av.version)}</div><div style="margin-top:8px">Incoming attachments: <b>${av.scan_incoming ? "scanned" : "not scanned"}</b><br>Outgoing attachments: <b>${av.scan_outgoing ? "scanned" : "not scanned"}</b><br>If the scanner is unavailable: <b>${av.fail_mode === "block" ? "block files" : "allow files"}</b></div>` :
           `<span class="st-fail">${icon("error")} Scanner offline</span><div class="muted" style="font-size:12px;margin-top:4px">${esc(av.version || "")}</div>`}</div></div>
@@ -1193,7 +1698,9 @@ function openSettings(tab = "general") {
         <div class="set-row"><b>Message display</b><div>Email HTML is sanitised on the server and shown in an isolated frame where scripts can't run.</div></div>
         <div class="set-row"><b>Session</b><div>Signed in as ${esc(S.me.email)}. <button class="btn text" id="set-logout">Sign out</button></div></div>`;
       $("#set-logout", tb).onclick = logout;
+      renderAccountSecurity($("#acct-sec", tb));
     },
+    apps: () => renderMailApps(tb),
     about: () => {
       const ent = S.me.edition === "enterprise";
       tb.innerHTML = `<div class="set-row"><b>Version</b><div>${esc(S.config.app_name)} ${esc(S.config.version)} · <b>${ent ? "Enterprise" : "Community"} Edition</b>${S.me.licensed_to ? ` · licensed to ${esc(S.me.licensed_to)}` : ""}</div></div>
@@ -1208,8 +1715,12 @@ function openSettings(tab = "general") {
   const collect = () => {
     if (body.dataset.tab !== "general") return;
     $$("[data-s]", tb).forEach((el) => { const k = el.dataset.s; s[k] = typeof S.settings[k] === "number" ? +el.value : el.value; });
-    $$("input[type=radio]:checked", tb).forEach((el) => (s[el.name] = el.value));
-    const sig = $(".sig-editor", tb); if (sig) s.signature = sig.innerHTML.trim() === "<br>" ? "" : sig.innerHTML.trim();
+    $$("input[type=radio]:checked", tb).forEach((el) => (s[el.name] = typeof S.settings[el.name] === "boolean" ? el.value === "true" : el.value));
+    if ($(".sig-box", tb)) {
+      s.signature_type = tb.dataset.sigt === "html" ? "html" : "text";
+      s.signature_text = $(".sig-text", tb).value.replace(/\s+$/, "");
+      s.signature = $(".sig-html", tb).value.trim();
+    }
   };
   $$(".tab", body).forEach((x) => (x.onclick = () => go(x.dataset.t)));
   const md = modal({ title: "Settings", body, wide: true, buttons: [{ label: "Cancel" }, { label: "Save changes", cls: "primary", onClick: async () => {
@@ -1247,6 +1758,8 @@ async function logout() {
   location.hash = ""; location.reload();
 }
 $("#logout-btn").onclick = logout;
+$("#mailapps-link").onclick = () => { $("#account-menu").classList.add("hidden"); openSettings("apps"); };
+$("#security-link").onclick = () => { $("#account-menu").classList.add("hidden"); openSettings("security"); };
 $("#menu-btn").onclick = () => { const a = $("#app"); if (innerWidth <= 900) a.classList.toggle("drawer"); else a.classList.toggle("collapsed"); };
 $("#scrim").onclick = () => $("#app").classList.remove("drawer");
 
@@ -1343,13 +1856,13 @@ function startPolling() {
       if (now > prev) {
         if (S.view === "list" && S.page === 0 && !S.selected.size) loadList(false).then(renderList);
         if (document.hidden && window.Notification && Notification.permission === "granted")
-          new Notification(`${S.config.app_name || "Mail"}: ${now - prev} new message${now - prev > 1 ? "s" : ""}`, { icon: "/img/logo.svg" });
+          new Notification(`${S.config.app_name || "Mail"}: ${now - prev} new message${now - prev > 1 ? "s" : ""}`, { icon: "/img/icon-192.png" });
       }
     } catch (e) {}
   }, 60000);
 }
 function stopPolling() { if (pollTimer) clearInterval(pollTimer); pollTimer = null; }
 
-window.ZoltisMail = { api, openComposer, snack, state: S, modal, popover, esc, icon: (n, c) => icon(n, c), h, fmtSize, avatar, qs, colorFor, initial, fmtDate, fail };
+window.ZoltisMail = { ask, browserTz, mdToHtml, loadPolicies, api, openComposer, snack, state: S, modal, popover, esc, icon: (n, c) => icon(n, c), h, fmtSize, avatar, qs, colorFor, initial, fmtDate, fail };
 boot();
 })();

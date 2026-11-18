@@ -30,8 +30,11 @@ COMMUNITY_FEATURES = [
 # Community Edition limits (Enterprise limits come from the license).
 # postmaster@<domain> aliases don't count towards max_aliases (every domain needs one for DMARC reports).
 COMMUNITY_LIMITS = {"max_accounts": 10, "max_aliases": 5, "max_domains": 2, "max_quota_mb": 720, "drive": False}
+# Community Edition always shows the Zoltis Mail name and logo. Only Enterprise (or a module that
+# lists "custom_branding" in its features) may replace them.
+PRODUCT_NAME = "Zoltis Mail"
 ENTERPRISE_FEATURES = [
-    "calendar", "drive", "contacts", "carddav", "caldav", "mobile_api",
+    "custom_branding", "calendar", "drive", "contacts", "carddav", "caldav", "mobile_api",
     "sso", "shared_mailboxes", "audit_log", "group_policies", "multi_server",
 ]
 
@@ -65,6 +68,16 @@ class Edition:
         self.modules = enterprise.load(info)
         for m in self.modules:
             self.features += [f for f in m.features if f not in self.features]
+
+    @property
+    def custom_branding(self) -> bool:
+        return self.name == "enterprise" and "custom_branding" in self.features
+
+    def app_name(self, configured: str | None) -> str:
+        """Product name shown to users: fixed to Zoltis Mail on Community Edition."""
+        if self.custom_branding and (configured or "").strip():
+            return configured.strip()
+        return PRODUCT_NAME
 
     def register(self, router):
         for m in self.modules:

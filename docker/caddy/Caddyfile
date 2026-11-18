@@ -1,10 +1,15 @@
 # Automatic HTTPS (Let's Encrypt) for the webmail and the mail server hostname.
 {
 	email {$ACME_EMAIL}
+	# Certificates for mta-sts.<your domain> are fetched on demand, only for domains hosted here
+	on_demand_tls {
+		ask http://web:8080/api/internal/tls-allowed
+	}
 }
 
 {$WEB_HOST} {
 	encode zstd gzip
+	header Strict-Transport-Security "max-age=63072000; includeSubDomains"
 	reverse_proxy web:8080
 	header -Server
 }
@@ -12,4 +17,20 @@
 # Only here so Caddy obtains a certificate that Postfix and Dovecot reuse.
 {$MAIL_HOST} {
 	respond "Zoltis Mail server" 200
+}
+
+# MTA-STS: https://mta-sts.<domain>/.well-known/mta-sts.txt for every hosted domain.
+# Tells other mail servers to deliver to you only over verified TLS.
+https:// {
+	tls {
+		on_demand
+	}
+	header -Server
+	@sts path /.well-known/mta-sts.txt
+	handle @sts {
+		reverse_proxy web:8080
+	}
+	handle {
+		respond "Not found" 404
+	}
 }

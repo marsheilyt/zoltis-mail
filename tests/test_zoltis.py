@@ -347,6 +347,112 @@ def test_deliverability_limited_to_own_domain(client):
     assert st == 403
 
 
+def test_inbox_tabs_sort_and_learn(client):
+    subjects = lambda r: {m["subject"] for m in r["messages"]}
+    st, r, _ = client.call("GET", "/api/messages?folder=INBOX&category=primary&size=100")
+    assert st == 200 and set(r["categories"]) == {"primary", "updates", "promotions", "social", "forums"}
+    assert r["category"] == "primary" and "Q4 roadmap review - slides attached" in subjects(r)
+    assert "This week in open source: 10 projects to watch" not in subjects(r)
+    _, promo, _ = client.call("GET", "/api/messages?folder=INBOX&category=promotions")
+    assert "This week in open source: 10 projects to watch" in subjects(promo)
+    _, upd, _ = client.call("GET", "/api/messages?folder=INBOX&category=updates")
+    assert "[zoltis] Pull request #42 merged" in subjects(upd)
+    assert r["categories"]["primary"] >= 1                               # unread counts per tab
+    # every message ends up in exactly one tab
+    totals = sum(client.call("GET", f"/api/messages?folder=INBOX&category={c}&size=10")[1]["total"]
+                 for c in ("primary", "updates", "promotions", "social", "forums"))
+    assert totals == client.call("GET", "/api/messages?folder=INBOX&size=10")[1]["total"]
+    # move the newsletter to Primary: that sender is remembered
+    nl = next(m for m in promo["messages"] if m["subject"].startswith("This week in open source"))
+    st, res, _ = client.call("POST", "/api/messages/category", {"folder": "INBOX", "uids": [nl["uid"]], "category": "primary",
+                                                                 "senders": [nl["from"][0]["email"]], "learn": True})
+    assert st == 200 and res["learned"] == ["news@techweekly.com"]
+    _, r, _ = client.call("GET", "/api/messages?folder=INBOX&category=primary&size=100")
+    assert nl["subject"] in subjects(r)
+    assert client.call("POST", "/api/messages/category", {"folder": "INBOX", "uids": [nl["uid"]], "category": "spam"})[0] == 400
+    client.call("POST", "/api/messages/category", {"folder": "INBOX", "uids": [nl["uid"]], "category": "promotions",
+                                                    "senders": [nl["from"][0]["email"]], "learn": True})
+    # search results and other folders aren't split into tabs
+    assert "categories" not in client.call("GET", "/api/messages?folder=INBOX&q=from:finance")[1]
+    assert "categories" not in client.call("GET", "/api/messages?folder=Archive")[1]
+    # tabs can be turned off
+    client.call("POST", "/api/settings", {"inbox_tabs": False})
+    assert "categories" not in client.call("GET", "/api/messages?folder=INBOX")[1]
+    client.call("POST", "/api/settings", {"inbox_tabs": True})
+
+
+def test_message_summary(client):
+    _, r, _ = client.call("GET", "/api/messages?folder=INBOX&q=subject:roadmap")
+    uid = r["messages"][0]["uid"]
+    st, m, _ = client.call("GET", f"/api/message?folder=INBOX&uid={uid}&peek=1")
+    a = m["assistant"]
+    assert st == 200 and a["summary"] and a["action_needed"] and a["attachments"] == ["Q4-roadmap.pdf"]
+    assert any(f["type"] == "deadline" for f in a["facts"])
+    client.call("POST", "/api/settings", {"smart_summary": False})
+    assert "assistant" not in client.call("GET", f"/api/message?folder=INBOX&uid={uid}&peek=1")[1]
+    client.call("POST", "/api/settings", {"smart_summary": True})
+
+
+def test_empty_trash_and_spam(client):
+    _, f, _ = client.call("GET", "/api/folders")
+    trash = next(x["name"] for x in f["folders"] if x["role"] == "trash")
+    _, r, _ = client.call("GET", "/api/messages?folder=INBOX&q=subject:%22Older%20message%20%2329%22")
+    uid = r["messages"][0]["uid"]
+    client.call("POST", "/api/messages/move", {"folder": "INBOX", "uids": [uid], "dest": "role:trash"})
+    assert client.call("GET", f"/api/messages?folder={trash}")[1]["total"] >= 1
+    st, res, _ = client.call("POST", "/api/folders/empty", {"folder": trash})
+    assert st == 200 and res["deleted"] >= 1
+    assert client.call("GET", f"/api/messages?folder={trash}")[1]["total"] == 0
+    assert client.call("POST", "/api/folders/empty", {"folder": "INBOX"})[0] == 400     # only Trash and Spam
+
+
+def test_spam_warning_before_opening(client):
+    """Spam: a safety report comes with the message, it isn't marked read, risky files can't be downloaded."""
+    import devmail
+    from datetime import datetime, timezone
+    box = devmail.STORE.boxes["demo@example.com"]
+    junk = next(n for n in box if n.lower() in ("junk", "spam"))
+    raw = devmail._mk('"support@yourbank.com" <win@prize-claim.example>', "demo@example.com", "You won! Claim now",
+                      "Claim your prize at https://prize-claim.example/login and http://bit.example/x", None,
+                      datetime.now(timezone.utc), ("prize.exe", "application/octet-stream", b"MZ fake"))
+    box[junk].add(raw, set(), datetime.now(timezone.utc))
+    _, r, _ = client.call("GET", f"/api/messages?folder={junk}")
+    m = next(x for x in r["messages"] if x["subject"] == "You won! Claim now")
+    st, msg, _ = client.call("GET", f"/api/message?folder={junk}&uid={m['uid']}")
+    c = msg["spam_check"]
+    assert st == 200 and c["links"] == 2 and "prize-claim.example" in c["link_domains"]
+    assert c["risky_attachments"][0]["filename"] == "prize.exe"
+    assert "support@yourbank.com" in c["spoofed_name"]
+    _, r, _ = client.call("GET", f"/api/messages?folder={junk}")
+    assert not next(x for x in r["messages"] if x["uid"] == m["uid"])["seen"]       # opening the warning isn't reading it
+    part = msg["attachments"][0]["part"]
+    st, body, _ = client.call("GET", f"/api/attachment?folder={junk}&uid={m['uid']}&part={part}")
+    assert st == 403 and "Spam" in body["error"]
+    # the same message in the Inbox carries no spam report
+    _, r, _ = client.call("GET", "/api/messages?folder=INBOX&size=1")
+    assert "spam_check" not in client.call("GET", f"/api/message?folder=INBOX&uid={r['messages'][0]['uid']}&peek=1")[1]
+
+
+def test_signature_text_or_html(client):
+    st, r, _ = client.call("POST", "/api/settings", {"signature_type": "html", "signature_text": "Jane Doe\nSales",
+                                                    "signature": '<p><b>Jane</b><script>alert(1)</script><img src="x" onerror="alert(2)"></p>'})
+    assert st == 200 and r["signature_type"] == "html" and r["signature_text"] == "Jane Doe\nSales"
+    assert "<b>Jane</b>" in r["signature"] and "<script" not in r["signature"] and "onerror" not in r["signature"]
+    assert client.call("POST", "/api/settings", {"signature_type": "both"})[1]["signature_type"] == "html"   # one type only
+    r = client.call("POST", "/api/settings", {"signature_type": "text"})[1]
+    assert r["signature_type"] == "text" and r["signature"]          # the other type is kept, just not used
+    client.call("POST", "/api/settings", {"signature_type": "text", "signature_text": "", "signature": ""})
+
+
+def test_old_html_signature_still_used(tmp_path):
+    import json
+    from zoltis.store import UserStore
+    st = UserStore(str(tmp_path))
+    st.save("old@example.com", {"settings": {"signature": "<b>Old</b>"}})
+    assert st.load("old@example.com")["settings"]["signature_type"] == "html"
+    assert st.load("new@example.com")["settings"]["signature_type"] == "text"
+
+
 def test_logout(client):
     assert client.call("POST", "/api/logout", {})[0] == 200
     assert client.call("GET", "/api/folders")[0] == 401

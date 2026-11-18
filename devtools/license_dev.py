@@ -5,7 +5,7 @@
         New signing key pair. Put the PUBLIC key into zoltis/licensing.py
         (TRUSTED_KEYS) and keep the PRIVATE key only on the licensing portal.
 
-    python3 devtools/license_dev.py issue --seed <hex> --kid k1 --domain acme.com [--domain ...]
+    python3 devtools/license_dev.py issue --seed <hex> --kid k1 --domain acme.com [--domain ...] --ip 203.0.113.9
                                           [--customer "Acme Ltd"] [--email a@acme.com] [--days 365]
         Issue a license key by hand (what the portal does on registration).
 
@@ -36,18 +36,19 @@ def keygen():
     return seed.hex(), L.ed25519_public_key(seed).hex()
 
 
-def issue_key(seed: bytes, kid: str, domains, customer="", email="", days=None, lid=None) -> str:
+def issue_key(seed: bytes, kid: str, domains, customer="", email="", days=None, lid=None, ips=("127.0.0.1",)) -> str:
     now = int(time.time())
     payload = {"v": 1, "kid": kid, "lid": lid or "lic_" + secrets.token_hex(8), "edition": "community",
-               "domains": sorted({d.lower() for d in domains}), "customer": customer, "email": email,
+               "domains": sorted({d.lower() for d in domains}), "ips": sorted(set(ips)), "customer": customer, "email": email,
                "issued": now, "expires": now + days * 86400 if days else None}
     return L.encode_token(payload, seed, L.KEY_CONTEXT)
 
 
-def issue_activation(seed: bytes, kid: str, lid: str, install_id: str, valid_days=30) -> str:
+def issue_activation(seed: bytes, kid: str, lid: str, install_id: str, valid_days=30, **billing) -> str:
+    """billing: plan ("community"|"managed"), paid_until (epoch), status ("active"|"overdue"|"suspended"), grace_days."""
     now = int(time.time())
     return L.encode_token({"v": 1, "kid": kid, "lid": lid, "install_id": install_id, "status": "active",
-                           "issued": now, "valid_until": now + valid_days * 86400}, seed, L.ACTIVATION_CONTEXT)
+                           "issued": now, "valid_until": now + valid_days * 86400, **billing}, seed, L.ACTIVATION_CONTEXT)
 
 
 class MockPortal:
@@ -58,9 +59,11 @@ class MockPortal:
         self.installs: dict[str, set] = {}   # lid -> install ids
         self.revoked: set[str] = set()
         self.calls: list[tuple] = []
+        self.billing: dict[str, dict] = {}   # lid -> {"plan", "paid_until", "status", "grace_days"} (what ZOcc would send)
         self.down = False
+        self.first_activation: dict[str, float] = {}   # lid -> when the key was first activated
 
-    def handle(self, path, body):
+    def handle(self, path, body, client_ip="127.0.0.1"):
         self.calls.append((path, body))
         if self.down:
             return 503, {"error": "maintenance"}
@@ -80,12 +83,21 @@ class MockPortal:
             return 403, {"error": "This license key has expired", "code": "expired"}
         if not ins.startswith("ins_"):
             return 400, {"error": "missing install_id", "code": "invalid"}
+        ips = {str(x) for x in info.get("ips") or []}
+        if client_ip not in ips:     # the request must come from the server IP entered on zoltismail.com
+            return 403, {"error": f"This key is registered for server IP {', '.join(sorted(ips)) or '(none)'}, but this "
+                                  f"server connects from {client_ip}. Update the server IP in your account on zoltismail.com",
+                         "code": "ip_mismatch"}
         used = self.installs.setdefault(lid, set())
         if ins not in used and len(used) >= self.max_installs:
             return 409, {"error": "This license key is already in use on another server. "
                                   "Release it on the licensing portal first", "code": "in_use"}
         used.add(ins)
-        return 200, {"activation": issue_activation(self.seed, self.kid, lid, ins, self.valid_days)}
+        # Community: valid one year from the first activation; renewing on zoltismail.com moves paid_until on.
+        first = self.first_activation.setdefault(lid, time.time())
+        billing = {"plan": "community", "paid_until": int(first + L.VALID_DAYS * 86400), "ip": client_ip,
+                   **self.billing.get(lid, {})}
+        return 200, {"activation": issue_activation(self.seed, self.kid, lid, ins, self.valid_days, **billing)}
 
     def serve(self, host="127.0.0.1", port=0):
         portal = self
@@ -100,7 +112,7 @@ class MockPortal:
                     body = json.loads(self.rfile.read(n) or b"{}")
                 except ValueError:
                     body = {}
-                status, out = portal.handle(self.path, body)
+                status, out = portal.handle(self.path, body, self.client_address[0])
                 data = json.dumps(out).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
@@ -124,6 +136,7 @@ def main(argv=None):
         p.add_argument("--seed", required=True, help="private key (hex)")
         p.add_argument("--kid", default="k1")
     i.add_argument("--domain", action="append", required=True)
+    i.add_argument("--ip", action="append", required=True, help="server IP address the key is for")
     i.add_argument("--customer", default="")
     i.add_argument("--email", default="")
     i.add_argument("--days", type=int)
@@ -134,7 +147,7 @@ def main(argv=None):
         priv, pub = keygen()
         print(f"private (keep secret, portal only): {priv}\npublic  (zoltis/licensing.py):     {pub}")
     elif a.cmd == "issue":
-        print(issue_key(bytes.fromhex(a.seed), a.kid, a.domain, a.customer, a.email, a.days))
+        print(issue_key(bytes.fromhex(a.seed), a.kid, a.domain, a.customer, a.email, a.days, ips=a.ip))
     else:
         url = MockPortal(bytes.fromhex(a.seed), a.kid, a.max_installs).serve(port=a.port)
         print(f"mock licensing portal on {url}  (set ZOLTIS_LICENSE_SERVER={url})")

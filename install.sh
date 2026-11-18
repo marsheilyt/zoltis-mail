@@ -78,6 +78,8 @@ if command -v timeout >/dev/null; then
   fi
 fi
 MEM=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+# ClamAV antivirus only on servers with 4 GB RAM or more (a "4 GB" VPS reports about 3.8 GB).
+AV_MIN_MB=3500
 SWAP=$(awk '/SwapTotal/ {print int($2/1024)}' /proc/meminfo)
 DISK=$(df -Pm . | awk 'NR==2 {print int($4/1024)}')
 (( MEM < 900 )) && warn "This server has only ${MEM} MB RAM. 1 GB is the minimum; expect slowness."
@@ -114,16 +116,16 @@ if [[ ! -f .env ]]; then
   MAILH=$(ask "Mail server name" "mail.$DOMAIN")
   IP=$(ask "This server's public IPv4 address" "$IP")
   EMAIL=$(ask "Email for Let's Encrypt certificate notices" "admin@$DOMAIN")
-  NAME=$(ask "Product name shown to users" "Zoltis Mail")
-  AV=true; PROF=antivirus; PLIMIT=100
+  NAME="Zoltis Mail"   # Community Edition: the Zoltis Mail name and logo can't be changed
+  PLIMIT=100
   (( MEM < 2500 )) && PLIMIT=20
-  if (( MEM < 1500 )); then
-    warn "This server has ${MEM} MB RAM: too little for ClamAV antivirus (it needs about 1.5 GB on its own)."
-    warn "Antivirus is turned off. The risky-attachment blocker still stops programs, macros and disguised files."
+  if (( MEM >= AV_MIN_MB )); then
+    AV=true; PROF=antivirus
+    info "ClamAV antivirus is on (this server has ${MEM} MB RAM)."
+  else
     AV=false; PROF=
-  elif (( MEM < 2500 )); then
-    warn "This server has ${MEM} MB RAM. ClamAV antivirus needs about 1.5 GB."
-    yes_no "Enable antivirus anyway?" || { AV=false; PROF=; }
+    info "ClamAV antivirus is off: it's only enabled on servers with 4 GB RAM or more (this one has ${MEM} MB)."
+    info "The risky-attachment blocker still stops programs, macros and disguised files."
   fi
   TOKEN=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' | cut -c1-8 | tr a-f A-F)
   cat > .env <<EOF
@@ -136,7 +138,7 @@ ANTIVIRUS=$AV
 COMPOSE_PROFILES=$PROF
 POSTFIX_PROCESS_LIMIT=$PLIMIT
 SETUP_TOKEN=$TOKEN
-LICENSE_REQUIRED=false
+LICENSE_REQUIRED=true
 LICENSE_KEY=
 TZ=$(cat /etc/timezone 2>/dev/null || echo UTC)
 EOF
@@ -147,8 +149,11 @@ set -a; . ./.env; set +a
 if (( MEM < 2500 )) && ! grep -q '^POSTFIX_PROCESS_LIMIT=' .env; then
   echo "POSTFIX_PROCESS_LIMIT=20" >> .env; POSTFIX_PROCESS_LIMIT=20
 fi
-if (( MEM < 1500 )) && [[ "${ANTIVIRUS:-}" == true ]]; then
-  warn "Antivirus is on in .env, but ${MEM} MB RAM is too little for ClamAV. Set ANTIVIRUS=false and COMPOSE_PROFILES= in .env."
+if (( MEM < AV_MIN_MB )) && [[ "${ANTIVIRUS:-}" == true ]]; then
+  # Below 4 GB RAM antivirus stays off, also on servers installed with an older version.
+  sed -i -e 's/^ANTIVIRUS=.*/ANTIVIRUS=false/' -e 's/^COMPOSE_PROFILES=.*/COMPOSE_PROFILES=/' .env
+  ANTIVIRUS=false; COMPOSE_PROFILES=
+  warn "ClamAV antivirus turned off: it's only enabled on servers with 4 GB RAM or more (this one has ${MEM} MB)."
 fi
 
 # ------------------------------------------------------------------ DNS check

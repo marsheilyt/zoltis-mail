@@ -52,10 +52,17 @@ DEFAULTS = {
         # Pre-filled domain on the login screen, e.g. example.com
         "default_domain": "",
     },
+    "integrity": {
+        # auto | true | false. auto = on when licensing is required or this is a signed official build.
+        # Changed program files then lock the service and are reported at the license check-in.
+        "enforce": "auto",
+    },
     "license": {
         "edition": "community",
-        # Community Edition license enforcement. false = no key needed (licensing turned off).
-        "required": "false",
+        # Community Edition license key, required from 2.3.0: every server has `grace_days` after it first
+        # starts on 2.3.0 to add one (Admin console > License). false = licensing off (development only).
+        "required": "true",
+        "grace_days": "7",
         # Enterprise Edition license file.
         "key_file": "/etc/zoltis/license.key",
         # Community Edition: licensing portal that activates keys (blank = built-in default).

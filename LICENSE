@@ -1,6 +1,60 @@
-Copyright (c) 2026 <Your Company Name>. All rights reserved.
+Zoltis Mail Community License
+Version 1.0, November 2026
 
-This is a placeholder. Choose the license for the Community Edition before
-distributing it (for example AGPL-3.0, MIT or Apache-2.0). The Enterprise
-Edition (zoltis/enterprise) is intended to be distributed under a
-commercial license. See docs/ENTERPRISE-ROADMAP.md.
+Copyright (c) 2026 Zealartis Global Technologies, Wyoming, USA. All rights reserved.
+
+This license covers the Zoltis Mail Community Edition ("the Software"): the source code, web files, images,
+logos and documentation in this repository. The separately distributed Enterprise Edition is not covered.
+
+1. Permission to use
+   You may install and run the official, unchanged Software, as published by Zealartis Global Technologies
+   ("Zealartis"), to provide email for your own organisation, its employees and members, at no charge,
+   subject to the Community Edition limits built into the Software and to the Zoltis Mail Community Edition
+   policies shown when the Software is set up (web/legal/).
+
+2. License key
+   Each installation needs a free license key from zoltismail.com, added within 7 days of installing. A key
+   is valid for one installation, for the server IP address and domains named in it, for one year from
+   activation, and may be renewed. Zealartis may revoke a key obtained with false information, used on more
+   than one server, or used in breach of this license or the policies.
+
+3. Source code
+   You may read, copy and study the source code, and change it for private testing and evaluation. You may
+   not use a changed copy to provide email to anyone. The Software checks that its program files match the
+   signed official release; a changed copy locks itself and reports the change to the licensing service.
+
+4. Restrictions
+   You may not:
+   a) remove, disable, bypass or tamper with the license check, the code-integrity check, the edition
+      limits or the suspension behaviour;
+   b) remove or change the Zoltis Mail name and logo, or the "Developed and maintained by Zealartis Global
+      Technologies" credit;
+   c) offer the Software, or access to it, to third parties as a hosted or managed service;
+   d) sell, rent, sublicense or redistribute the Software, changed or unchanged, except by pointing others
+      to the official repository.
+
+5. Trademarks
+   "Zoltis", "Zoltis Mail" and the Zoltis Mail logo are trademarks of Zealartis. This license grants no
+   right to use them except to identify the unchanged Software.
+
+6. Third-party components
+   The Software includes third-party components under their own licenses, which take precedence for those
+   components. web/js/vendor/qrcode.js: QR Code Generator for JavaScript, copyright (c) 2009 Kazuhiko Arase,
+   MIT license. The Docker images install open-source packages (Postfix, Dovecot, OpenDKIM, ClamAV, Caddy,
+   Unbound and others) under their own licenses.
+
+7. Termination
+   This license ends automatically if you breach it. You must then stop using the Software. Sections 4 to 9
+   continue to apply.
+
+8. No warranty
+   THE SOFTWARE AND THE LICENSE KEY ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+   INCLUDING MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. EMAIL DELIVERY IS NOT
+   GUARANTEED.
+
+9. Limitation of liability
+   TO THE EXTENT THE LAW ALLOWS, ZEALARTIS IS NOT LIABLE FOR ANY LOST DATA, LOST MAIL, LOST PROFITS OR
+   INDIRECT, INCIDENTAL OR CONSEQUENTIAL DAMAGES ARISING FROM THE SOFTWARE OR THIS LICENSE. This license is
+   governed by the laws of the State of Wyoming, USA.
+
+Questions: https://zoltismail.com/legal/terms

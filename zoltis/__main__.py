@@ -106,8 +106,8 @@ def main(argv=None):
         from .licensing import LicenseError
         app = App(cfg)
         lic = app.license
-        if not lic.enabled:
-            print("Licensing is turned off ([license] required = false). No key is needed.")
+        if not lic.enabled and args.action != "activate":
+            print("Licensing is turned off ([license] required = false). A key can still be added with: zoltis license activate")
             sys.exit(0)
         try:
             if args.action == "activate":

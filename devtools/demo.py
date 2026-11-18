@@ -46,6 +46,8 @@ env = {
     "ZOLTIS_MAIL_SERVER_SMTP_HOST": "127.0.0.1", "ZOLTIS_MAIL_SERVER_SMTP_PORT": "11587",
     "ZOLTIS_MAIL_SERVER_HOSTNAME": "mail.example.com", "ZOLTIS_MAIL_SERVER_PUBLIC_IP": "203.0.113.25",
     "ZOLTIS_SETUP_TOKEN": "DEMO1234",
+    "ZOLTIS_INTEGRITY_ENFORCE": "false",               # a source checkout is never a signed release
+    "ZOLTIS_MAIL_SERVER_INTERNAL_SECURITY": "plain",   # the emulated mail server has no TLS
     "ZOLTIS_ANTIVIRUS_ENABLED": "true", "ZOLTIS_ANTIVIRUS_SOCKET": "-", "ZOLTIS_ANTIVIRUS_HOST": "127.0.0.1",
     "ZOLTIS_ANTIVIRUS_PORT": "13310",
 }

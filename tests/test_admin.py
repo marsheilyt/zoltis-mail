@@ -31,6 +31,7 @@ def bundled(mail, portal):  # noqa: F811
         "ZOLTIS_MAIL_SERVER_MODE": "bundled", "ZOLTIS_MAIL_SERVER_CONF_DIR": conf,
         "ZOLTIS_MAIL_SERVER_IMAP_HOST": "127.0.0.1", "ZOLTIS_MAIL_SERVER_IMAP_PORT": str(mail["imap"]),
         "ZOLTIS_MAIL_SERVER_HOSTNAME": "mail.acme.test", "ZOLTIS_SETUP_TOKEN": "TEST1234",
+        "ZOLTIS_MAIL_SERVER_INTERNAL_SECURITY": "plain",   # the test IMAP server has no TLS
         "ZOLTIS_BRANDING_DEFAULT_DOMAIN": "",
     }
     saved = {k: os.environ.get(k) for k in env}
@@ -66,20 +67,29 @@ def admin(bundled, portal):
     st, r, _ = c.call("POST", "/api/setup", {"token": "WRONG", "email": ADMIN[0], "password": ADMIN[1]})
     assert st == 403
     assert cfg["license"]["state"] == "missing"
+    assert cfg["policies"]["version"] == "1.0" and cfg["policies"]["url"].endswith(".md")
     st, r, _ = c.call("POST", "/api/setup", {"token": "test1234", "email": ADMIN[0], "password": ADMIN[1]})
+    assert st == 400 and "policies" in r["error"]                            # the policies must be accepted
+    st, r, _ = c.call("POST", "/api/setup", {"token": "test1234", "email": ADMIN[0], "password": ADMIN[1], "accept_policies": "0.9"})
+    assert st == 400 and "policies" in r["error"]                            # ... the current version
+    pol = Client(base).call("GET", cfg["policies"]["url"])
+    assert pol[0] == 200 and b"Acceptable use" in pol[1] and b"Encryption" not in pol[1]
+    st, r, _ = c.call("POST", "/api/setup", {"token": "test1234", "email": ADMIN[0], "password": ADMIN[1], "accept_policies": "1.0"})
     assert st == 400 and "license key" in r["error"]                        # a key is required
     st, r, _ = c.call("POST", "/api/setup", {"token": "test1234", "email": ADMIN[0], "password": ADMIN[1],
-                                             "license_key": portal.issue("other.test")})
+                                             "license_key": portal.issue("other.test"), "accept_policies": "1.0"})
     assert st == 400 and "other.test" in r["error"]                          # key must cover the admin's domain
     st, r, _ = c.call("POST", "/api/setup", {"token": "test1234", "email": ADMIN[0], "password": ADMIN[1],
-                                             "license_key": "ZM1.forged.key"})
+                                             "license_key": "ZM1.forged.key", "accept_policies": "1.0"})
     assert st == 400
     assert bundled[1].accounts.count() == 0
     st, r, _ = c.call("POST", "/api/setup", {"token": "test1234", "email": ADMIN[0], "password": ADMIN[1], "name": "Boss",
-                                             "license_key": portal.issue("acme.test", "second.test", customer="Acme")})
+                                             "license_key": portal.issue("acme.test", "second.test", customer="Acme"), "accept_policies": "1.0", "timezone": "Asia/Dubai"})
     assert st == 200, r
     st, r, _ = c.call("POST", "/api/setup", {"token": "TEST1234", "email": "x@acme.test", "password": ADMIN[1]})
     assert st == 409
+    pst = bundled[1].accounts.policy_status()
+    assert pst["accepted"] and pst["accepted_by"] == ADMIN[0] and pst["version"] == "1.0"   # who accepted, when
     c, st, body = login(base, *ADMIN)
     assert st == 200, body
     return c
@@ -282,6 +292,49 @@ def test_dns_records_in_cloudflare_form():
     assert other[("A", "mail")]["zone"] == "acme.test" and other[("MX", "@")]["content"] == "mail.acme.test"
 
 
+def test_mta_sts_records_policy_and_modes(admin, bundled):
+    import urllib.request
+    base, app, _ = bundled
+    st, r, _ = admin.call("GET", "/api/admin/domains")
+    d = next(x for x in r["domains"] if x["name"] == "acme.test")
+    recs = {(x["type"], x["host"]): x for x in d["dns"]}
+    assert d["mta_sts"] == "testing"
+    assert recs[("CNAME", "mta-sts")]["content"] == "mail.acme.test" and recs[("CNAME", "mta-sts")]["proxy"] == "DNS only"
+    assert recs[("TXT", "_mta-sts")]["content"].startswith("v=STSv1; id=")
+    assert recs[("TXT", "_smtp._tls")]["content"] == "v=TLSRPTv1; rua=mailto:postmaster@acme.test"
+
+    def policy(host):
+        req = urllib.request.Request(base + "/.well-known/mta-sts.txt", headers={"Host": host})
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return resp.status, resp.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, ""
+    st, body = policy("mta-sts.acme.test")
+    assert st == 200 and "mode: testing\r\n" in body and "mx: mail.acme.test\r\n" in body and "max_age: 86400" in body
+    assert policy("mta-sts.unknown.test")[0] == 404 and policy("acme.test")[0] == 404
+    # Caddy's on-demand certificate check
+    c = Client(base)
+    assert c.call("GET", "/api/internal/tls-allowed?domain=mta-sts.acme.test")[0] == 200
+    assert c.call("GET", "/api/internal/tls-allowed?domain=evil.example")[0] == 404
+
+    old_id = recs[("TXT", "_mta-sts")]["content"]
+    st, r, _ = admin.call("POST", "/api/admin/domains/mta-sts", {"name": "acme.test", "mode": "enforce"})
+    assert st == 200 and r["mta_sts"] == "enforce" and r["mta_sts_id"]
+    st, body = policy("mta-sts.acme.test")
+    assert "mode: enforce" in body and "max_age: 604800" in body
+    st, r, _ = admin.call("GET", "/api/admin/domains")
+    d = next(x for x in r["domains"] if x["name"] == "acme.test")
+    assert next(x for x in d["dns"] if x["host"] == "_mta-sts")["content"] != old_id
+    assert admin.call("POST", "/api/admin/domains/mta-sts", {"name": "acme.test", "mode": "strict"})[0] == 400
+    admin.call("POST", "/api/admin/domains/mta-sts", {"name": "acme.test", "mode": "off"})
+    assert policy("mta-sts.acme.test")[0] == 404
+    st, r, _ = admin.call("GET", "/api/admin/domains")
+    d = next(x for x in r["domains"] if x["name"] == "acme.test")
+    assert not any(x["host"] in ("mta-sts", "_mta-sts", "_smtp._tls") for x in d["dns"])
+    admin.call("POST", "/api/admin/domains/mta-sts", {"name": "acme.test", "mode": "testing"})
+
+
 def test_domains_api_reports_postmaster(admin):
     st, r, _ = admin.call("GET", "/api/admin/domains")
     d = next(x for x in r["domains"] if x["name"] == "acme.test")
@@ -382,3 +435,291 @@ def test_migration_api_files(admin, bundled):
     assert admin.call("GET", "/api/admin/migration/download?file=../accounts.db")[0] == 400
     st, r, _ = admin.call("POST", "/api/admin/migration/delete", {"file": f["file"]})
     assert st == 200 and not os.path.exists(os.path.join(bundled[1].export_dir, f["file"]))
+
+
+# ---------------------------------------------------------------- 2-step verification & app passwords
+def test_totp_rfc6238_vector():
+    from zoltis import totp
+    secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"            # "12345678901234567890"
+    assert totp.now_code(secret, at=59) == "287082"           # RFC 6238 (last 6 of 94287082)
+    assert totp.now_code(secret, at=1111111109) == "081804"
+    step = totp.verify(secret, "081804", at=1111111109)
+    assert step == 1111111109 // 30
+    assert totp.verify(secret, "081804", last_counter=step, at=1111111109) is None   # no reuse
+    assert totp.verify(secret, "000000", at=1111111109) is None
+    assert totp.normalize_recovery("ABCDE 23456") == "abcde-23456"
+    assert all(len(c) == 11 for c in totp.new_recovery_codes())
+
+
+def test_default_theme_is_light(tmp_path):
+    from zoltis.store import UserStore
+    assert UserStore(str(tmp_path)).load("new@acme.test")["settings"]["theme"] == "light"
+
+
+def test_two_step_verification_and_app_password(admin, bundled):
+    import plistlib
+    import re
+    from zoltis import totp
+    base, app, conf = bundled
+    who, pw = "ann@acme.test", "Ann-pass-123"
+    users = lambda: open(os.path.join(conf, "dovecot/users")).read()
+    app_pws = lambda: open(os.path.join(conf, "dovecot/app-passwords")).read()
+    line = lambda: next(l for l in users().splitlines() if l.startswith(who + ":"))
+
+    c, st, r = login(base, who, pw)
+    assert st == 200 and "twofa_required" not in r
+    st, r, _ = c.call("GET", "/api/account/security")
+    assert r == {"available": True, "twofa": False, "recovery_left": 0, "app_password": False, "app_password_created": None}
+
+    # turn it on
+    assert c.call("POST", "/api/account/2fa/start", {"password": "wrong"})[0] == 403
+    st, r, _ = c.call("POST", "/api/account/2fa/start", {"password": pw})
+    assert st == 200 and r["uri"].startswith("otpauth://totp/") and f"secret={r['secret']}" in r["uri"]
+    secret = r["secret"]
+    assert c.call("POST", "/api/account/2fa/enable", {"code": "000000"})[0] == 400
+    enable_code = totp.now_code(secret)
+    st, r, _ = c.call("POST", "/api/account/2fa/enable", {"code": enable_code})
+    assert st == 200 and len(r["recovery_codes"]) == 10
+    codes = r["recovery_codes"]
+    assert "allow_nets=" in line() and "allow_nets" not in next(l for l in users().splitlines() if l.startswith(ADMIN[0]))
+    st, accts, _ = admin.call("GET", "/api/admin/accounts")
+    a = next(x for x in accts["accounts"] if x["email"] == who)
+    assert a["twofa"] is True and "totp_secret" not in a and "recovery_codes" not in a
+
+    # the account password alone no longer gives mail apps access (only the webmail's network)
+    assert devmail.STORE.authenticate(who, pw, "203.0.113.5")[0] is None
+    assert devmail.STORE.authenticate(who, pw, "127.0.0.1")[0] == who
+
+    # sign-in needs the second step
+    c2, st, r = login(base, who, pw)
+    assert st == 200 and r["twofa_required"] and r["ticket"]
+    assert c2.call("GET", "/api/me")[0] == 401
+    ticket = r["ticket"]
+    assert c2.call("POST", "/api/login/2fa", {"ticket": ticket, "code": "123456"})[0] == 401
+    assert c2.call("POST", "/api/login/2fa", {"ticket": ticket, "code": enable_code})[0] == 401  # used at enable
+    assert c2.call("POST", "/api/login/2fa", {"ticket": "bogus", "code": codes[0]})[0] == 401
+    st, r, _ = c2.call("POST", "/api/login/2fa", {"ticket": ticket, "code": codes[0].upper().replace("-", " ")})
+    assert st == 200 and r["recovery_left"] == 9
+    assert c2.call("GET", "/api/me")[0] == 200
+    assert c2.call("POST", "/api/login/2fa", {"ticket": ticket, "code": codes[1]})[0] == 401     # ticket is single-use
+
+    c3, st, r = login(base, who, pw)
+    assert c3.call("POST", "/api/login/2fa", {"ticket": r["ticket"], "code": codes[0]})[0] == 401  # recovery code is single-use
+    st, r2, _ = c3.call("POST", "/api/login/2fa", {"ticket": r["ticket"], "code": totp.now_code(secret, time.time() + 30)})
+    assert st == 200, r2
+    st, r, _ = c3.call("POST", "/api/send", {"to": ADMIN[0], "subject": "sent with 2fa on", "html": "<p>hi</p>"})
+    assert st == 200, r                                                           # webmail still sends
+
+    # app password for mail apps
+    st, r, _ = c3.call("POST", "/api/account/app-password", {"password": pw})
+    assert st == 200 and re.fullmatch(r"[a-z]{4}(-[a-z]{4}){3}", r["app_password"])
+    apw = r["app_password"]
+    assert app_pws().startswith(who + ":{SHA512-CRYPT}$6$")
+    assert devmail.STORE.authenticate(who, apw, "203.0.113.5")[0] == who
+    assert c3.call("POST", "/api/login", {"email": who, "password": apw})[1].get("twofa_required")  # IMAP accepts it, 2FA still asked
+
+    # mail app setup info + Apple profile
+    st, m, _ = c3.call("GET", "/api/account/mail-setup")
+    assert m["imap"] == {"host": "mail.acme.test", "port": 993, "security": "SSL/TLS"} and m["smtp"]["port"] == 587
+    assert m["twofa"] and m["app_password"] and m["username"] == who
+    st, data, hdr = c3.call("GET", "/api/account/apple-profile")
+    assert st == 200 and hdr.get_content_type() == "application/x-apple-aspen-config"
+    p = plistlib.loads(data)["PayloadContent"][0]
+    assert p["EmailAddress"] == who and p["IncomingMailServerHostName"] == "mail.acme.test" and p["IncomingMailServerPortNumber"] == 993
+    assert pw not in data.decode() and apw not in data.decode()
+
+    # admin turns it off (lost phone)
+    st, r, _ = admin.call("POST", "/api/admin/accounts/update", {"email": who, "reset_2fa": True})
+    assert st == 200 and r["twofa"] is False and r["has_app_password"] is False
+    assert "allow_nets" not in line() and who not in app_pws()
+    assert devmail.STORE.authenticate(who, pw, "203.0.113.5")[0] == who
+    c4, st, r = login(base, who, pw)
+    assert st == 200 and "twofa_required" not in r
+
+
+def test_mobile_app_api_token_and_discovery(admin, bundled):
+    """The future Zoltis Mail app: find the server, sign in for a bearer token (with 2FA), use the API."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+    from zoltis import totp
+    base = bundled[0]
+    who, pw = "app-user@acme.test", "App-pass-1234"
+    assert admin.call("POST", "/api/admin/accounts", {"email": who, "password": pw})[0] == 200
+
+    def raw(method, path, body=None, token=None, csrf=True):
+        req = urllib.request.Request(base + path, data=_json.dumps(body).encode() if body is not None else None, method=method)
+        req.add_header("Content-Type", "application/json")
+        if csrf:
+            req.add_header("X-Zoltis", "1")
+        if token:
+            req.add_header("Authorization", "Bearer " + token)
+        try:
+            with urllib.request.urlopen(req) as r:   # no cookie jar, like a native app
+                return r.status, _json.loads(r.read()), r.headers
+        except urllib.error.HTTPError as e:
+            return e.code, _json.loads(e.read()), e.headers
+
+    st, d, _ = raw("GET", "/.well-known/zoltis-mail.json")
+    assert st == 200 and d["service"] == "zoltis-mail" and d["api_version"] == 1
+    assert d["auth"]["scheme"] == "Bearer" and d["imap"] == {"host": "mail.acme.test", "port": 993, "security": "ssl"}
+    assert d["features"]["two_factor"] and raw("GET", "/api/client")[1] == d
+
+    # sign in as the app: a token in the body, no cookie
+    st, r, h = raw("POST", "/api/login", {"email": who, "password": pw, "client": "app"})
+    assert st == 200 and r["token_type"] == "Bearer" and r["token"] and r["expires_in"] > 0 and not h.get("Set-Cookie")
+    tok = r["token"]
+    st, me, _ = raw("GET", "/api/me", token=tok)
+    assert st == 200 and me["email"] == who
+    assert raw("GET", "/api/folders", token=tok)[0] == 200
+    assert raw("GET", "/api/me", token="not-a-token")[0] == 401
+    # the browser sign-in is unchanged (cookie, no token)
+    st, r, h = raw("POST", "/api/login", {"email": who, "password": pw})
+    assert st == 200 and "token" not in r and "zm_sid=" in h.get("Set-Cookie", "")
+
+    # with 2-step verification on, the app finishes sign-in with the code and gets its token then
+    c, _, _ = login(base, who, pw)
+    secret = c.call("POST", "/api/account/2fa/start", {"password": pw})[1]["secret"]
+    assert c.call("POST", "/api/account/2fa/enable", {"code": totp.now_code(secret)})[0] == 200
+    st, r, h = raw("POST", "/api/login", {"email": who, "password": pw, "client": "app"})
+    assert st == 200 and r["twofa_required"] and "token" not in r
+    st, r, h = raw("POST", "/api/login/2fa", {"ticket": r["ticket"], "code": totp.now_code(secret, time.time() + 30)})
+    assert st == 200 and r["token"] and not h.get("Set-Cookie")
+    tok = r["token"]
+    assert raw("GET", "/api/me", token=tok)[0] == 200
+
+    # sign out ends the token
+    assert raw("POST", "/api/logout", {}, token=tok)[0] == 200
+    assert raw("GET", "/api/me", token=tok)[0] == 401
+    admin.call("POST", "/api/admin/accounts/delete", {"email": who})
+
+
+def test_managed_plan_suspension_locks_webmail_and_mail_apps(admin, bundled, portal):
+    base, app, conf = bundled
+    lic = app.license
+    lid = lic.info["lid"]
+    users = lambda: open(os.path.join(conf, "dovecot/users")).read()
+    who, pw = ADMIN
+
+    def zocc(**billing):        # what ZOcc puts in the next activation certificate
+        portal.billing[lid] = billing
+        lic.refresh()
+
+    c, st, _ = login(base, who, pw)
+    assert st == 200
+    zocc(plan="managed", paid_until=time.time() - 2 * 86400, status="overdue")
+    assert not lic.locked and c.call("GET", "/api/me")[0] == 200                 # grace period: still works
+    st, ov, _ = c.call("GET", "/api/admin/license")
+    assert ov["billing"]["status"] == "overdue" and ov["billing"]["lock_at"]
+    zocc(plan="managed", paid_until=time.time() - 11 * 86400, status="suspended")
+    assert lic.locked
+    assert c.call("GET", "/api/me")[0] == 401                                    # signed-in users are thrown out
+    _, st, r = login(base, who, pw)
+    assert st == 423 and "customer portal" in r["error"]                         # nobody can sign in
+    assert all("nologin=y" in l and "Service_suspended" in l for l in users().splitlines() if l)
+    assert devmail.STORE.authenticate(who, pw)[0] is None                        # IMAP/SMTP refused
+    assert f"{who} OK" in open(os.path.join(conf, "postfix/mailboxes")).read()   # incoming mail still accepted
+    st, cfg, _ = Client(base).call("GET", "/api/config")
+    assert cfg["license"]["suspended"]                                           # login page can explain why
+    zocc(plan="managed", paid_until=time.time() + 30 * 86400, status="active")   # unlocked from ZOcc
+    assert not lic.locked and "Service_suspended" not in users()
+    assert login(base, who, pw)[1] == 200
+    zocc()                                                                       # back to a plain community certificate
+
+
+def test_modified_code_locks_service_and_is_reported(admin, bundled, portal, monkeypatch):
+    """Changed program files (e.g. a replaced logo): reported to the licensing portal, every sign-in
+    refused while enforced, incoming mail still stored; putting the original file back unlocks."""
+    import shutil
+    from zoltis import __version__, integrity as I, licensing as L
+    base, app, conf = bundled
+    who, pw = ADMIN
+    seed = os.urandom(32)
+    monkeypatch.setitem(L.TRUSTED_KEYS, "rel", L.ed25519_public_key(seed).hex())
+    d = tempfile.mkdtemp()
+    pkg, web = os.path.join(d, "zoltis"), os.path.join(d, "web")
+    ign = shutil.ignore_patterns("__pycache__", "*.pyc", I.MANIFEST_NAME)
+    shutil.copytree(os.path.join(ROOT, "zoltis"), pkg, ignore=ign)
+    shutil.copytree(os.path.join(ROOT, "web"), web, ignore=ign)
+    open(os.path.join(pkg, I.MANIFEST_NAME), "w").write(I.sign_manifest(I.compute(pkg, web), __version__, seed, "rel"))
+    mon = app.integrity
+    monkeypatch.setattr(mon, "pkg_dir", pkg)
+    monkeypatch.setattr(mon, "web_dir", web)
+    monkeypatch.setenv("ZOLTIS_INTEGRITY_ENFORCE", "auto")      # signed build -> enforced
+    users = lambda: open(os.path.join(conf, "dovecot/users")).read()
+
+    assert mon.check()["status"] == "ok" and mon.enforced and not app.license.locked
+    c, st, _ = login(base, who, pw)
+    assert st == 200
+    assert c.call("GET", "/api/admin/license")[1]["integrity"]["status"] == "ok"
+
+    logo = os.path.join(web, "img/logo.svg")
+    original = open(logo).read()
+    open(logo, "w").write(original.replace("#0e1b33", "#ff0000"))   # someone swaps the logo colours
+    portal.calls.clear()
+    mon.check()
+    assert app.license.locked and app.license.state() == "modified"
+    for _ in range(50):                                              # reported to the portal right away
+        if portal.calls:
+            break
+        time.sleep(0.05)
+    path, body = portal.calls[-1]
+    assert path == "/v1/activate" and body["integrity"]["status"] == "modified"
+    assert body["integrity"]["files"] == ["web/img/logo.svg"] and body["license_id"] == app.license.info["lid"]
+    assert c.call("GET", "/api/me")[0] == 401                        # signed-in users thrown out
+    _, st, r = login(base, who, pw)
+    assert st == 423 and "program files were changed" in r["error"]
+    assert all("nologin=y" in l for l in users().splitlines() if l)  # IMAP/SMTP refused
+    assert f"{who} OK" in open(os.path.join(conf, "postfix/mailboxes")).read()
+    assert Client(base).call("GET", "/api/config")[1]["license"]["suspended"]
+
+    open(logo, "w").write(original)                                  # official file restored
+    mon.check()
+    assert not app.license.locked and login(base, who, pw)[1] == 200
+
+    monkeypatch.setenv("ZOLTIS_INTEGRITY_ENFORCE", "false")         # detection only: reported, not locked
+    open(logo, "w").write("changed")
+    assert mon.check()["status"] == "modified" and not app.license.locked
+    monkeypatch.undo()
+    mon.check()
+    shutil.rmtree(d)
+    assert not app.license.locked
+
+
+def test_new_policy_version_must_be_accepted_before_more_accounts(admin, bundled, monkeypatch):
+    """Section 8: when the policies change, the admin accepts the new version before creating accounts or domains."""
+    app = bundled[1]
+    admin, st, _ = login(bundled[0], *ADMIN)      # earlier tests may have signed everyone out
+    assert st == 200
+    monkeypatch.setattr(app.accounts, "policy_version", "1.1")
+    st, r, _ = admin.call("GET", "/api/admin/overview")
+    assert st == 200, r
+    assert r["policies"]["required"] and not r["policies"]["accepted"]
+    st, r, _ = admin.call("POST", "/api/admin/accounts", {"email": "pol@acme.test", "password": "Pol-pass-123"})
+    assert st == 428 and "policies" in r["error"]
+    assert admin.call("POST", "/api/admin/domains", {"name": "pol.test"})[0] == 428
+    assert admin.call("POST", "/api/admin/policies/accept", {"version": "1.0"})[0] == 400      # old version
+    st, r, _ = admin.call("POST", "/api/admin/policies/accept", {"version": "1.1"})
+    assert st == 200 and r["accepted"] and r["accepted_by"] == ADMIN[0]
+    st, r, _ = admin.call("POST", "/api/admin/accounts", {"email": "pol@acme.test", "password": "Pol-pass-123"})
+    assert st in (200, 402), r                                              # no longer blocked by the policies
+    if st == 200:
+        admin.call("POST", "/api/admin/accounts/delete", {"email": "pol@acme.test", "purge": True})
+    assert any(e["action"] == "policies.accept" for e in admin.call("GET", "/api/admin/audit")[1]["events"])
+
+
+def test_server_time_zone_from_setup_and_admin(bundled):
+    """The sign-in page shows "Server time" in the zone taken from the admin's browser at setup."""
+    base, app, _ = bundled
+    st, cfg, _ = Client(base).call("GET", "/api/config")
+    t = cfg["server_time"]
+    assert t["timezone"] == "Asia/Dubai" and t["configured"] and abs(t["now"] - time.time()) < 5
+    c, st, _ = login(base, *ADMIN)
+    assert st == 200
+    assert c.call("POST", "/api/admin/timezone", {"timezone": "Not/A Zone"})[0] == 400
+    assert c.call("POST", "/api/admin/timezone", {"timezone": "../etc/passwd"})[0] == 400
+    st, r, _ = c.call("POST", "/api/admin/timezone", {"timezone": "Europe/London"})
+    assert st == 200 and r["timezone"] == "Europe/London"
+    assert Client(base).call("GET", "/api/config")[1]["server_time"]["timezone"] == "Europe/London"
+    assert c.call("GET", "/api/admin/overview")[1]["server_time"]["timezone"] == "Europe/London"
+    c.call("POST", "/api/admin/timezone", {"timezone": "Asia/Dubai"})

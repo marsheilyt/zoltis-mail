@@ -23,10 +23,10 @@ submissions inet n      -       n       -       -       smtpd
   -o smtpd_recipient_restrictions=permit_sasl_authenticated,reject
   -o smtpd_relay_restrictions=permit_sasl_authenticated,reject
   -o milter_macro_daemon_name=ORIGINATING
-# Port 10587: internal only (not published) - used by the Zoltis webmail container
+# Port 10587: internal only (not published) - used by the Zoltis webmail container (TLS required)
 10587     inet  n       -       n       -       -       smtpd
   -o syslog_name=postfix/webmail
-  -o smtpd_tls_security_level=may
+  -o smtpd_tls_security_level=encrypt
   -o smtpd_tls_auth_only=no
   -o smtpd_sasl_auth_enable=yes
   -o smtpd_client_restrictions=permit_sasl_authenticated,reject

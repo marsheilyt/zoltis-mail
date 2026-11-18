@@ -100,7 +100,12 @@ class Store:
             fields = dict(x.split("=", 1) for x in extra.split() if "=" in x)
             m = re.search(r"storage=(\d+)M", fields.get("userdb_quota_rule", ""))
             users[email] = {"hash": pw_hash, "quota_kb": int(m.group(1)) * 1024 if m else 0,
-                            "nologin": fields.get("nologin") == "y"}
+                            "nologin": fields.get("nologin") == "y", "allow_nets": fields.get("allow_nets", "")}
+        app_pw = {}
+        for l in lines("dovecot/app-passwords"):
+            parts = l.split(":")
+            app_pw[parts[0]] = parts[1]
+        self.app_passwords = app_pw
         master = {}
         for l in lines("dovecot/master-users"):
             parts = l.split(":")
@@ -128,9 +133,13 @@ class Store:
             self._verified[key] = ok
         return self._verified[key]
 
-    def authenticate(self, user, pw):
-        """Return (mailbox_user or None, error)."""
+    def authenticate(self, user, pw, ip="127.0.0.1"):
+        """Return (mailbox_user or None, error). Like the bundled Dovecot: app password first,
+        then the account password (limited to allow_nets when the account has 2-step verification)."""
         self.sync()
+        if "*" not in user and user in getattr(self, "app_passwords", {}) and user in self.file_users \
+                and self._check_hash(pw, self.app_passwords[user]):
+            return user, None
         if "*" in user:  # master login: user*master
             target, master = user.rsplit("*", 1)
             if master in self.master and self._check_hash(pw, self.master[master]) and target in self.boxes:
@@ -140,6 +149,11 @@ class Store:
             u = self.file_users[user]
             if not self._check_hash(pw, u["hash"]):
                 return None, "AUTHENTICATIONFAILED"
+            if u["allow_nets"]:
+                import ipaddress
+                addr = ipaddress.ip_address(ip)
+                if not any(addr in ipaddress.ip_network(n.strip(), strict=False) for n in u["allow_nets"].split(",") if n.strip()):
+                    return None, "AUTHENTICATIONFAILED"
             if u["nologin"]:
                 return None, "AUTHORIZATIONFAILED"
             return user, None
@@ -306,7 +320,7 @@ class IMAPHandler(socketserver.StreamRequestHandler):
             return "BYE"
         if verb == "LOGIN":
             u, p = [a.decode() if isinstance(a, bytes) else a for a in args[:2]]
-            who, err = STORE.authenticate(u, p)
+            who, err = STORE.authenticate(u, p, self.client_address[0])
             if who:
                 self.user = who
                 return self.line(f"{tag} OK logged in")
@@ -450,6 +464,10 @@ class IMAPHandler(socketserver.StreamRequestHandler):
                 has = {"SEEN": "\\Seen", "UNSEEN": "\\Seen", "FLAGGED": "\\Flagged", "ANSWERED": "\\Answered"}[c] in m.flags
                 ok &= (not has) if c == "UNSEEN" else has
                 i += 1
+            elif c in ("KEYWORD", "UNKEYWORD"):
+                has = crit[i + 1].lower() in {f.lower() for f in m.flags}
+                ok &= has if c == "KEYWORD" else not has
+                i += 2
             elif c in ("FROM", "TO", "CC", "BCC", "SUBJECT"):
                 ok &= crit[i + 1].lower() in str(p.get(c.title(), "")).lower()
                 i += 2
@@ -561,7 +579,7 @@ class SMTPHandler(socketserver.StreamRequestHandler):
                     self.line("334 ")
                     tok = self.rfile.readline().decode().strip()
                 _, u, p = base64.b64decode(tok).decode().split("\0")
-                who, _ = STORE.authenticate(u, p)
+                who, _ = STORE.authenticate(u, p, self.client_address[0])
                 if who and "*" not in u:
                     user = u
                     self.line("235 ok")
@@ -572,7 +590,7 @@ class SMTPHandler(socketserver.StreamRequestHandler):
                 u = base64.b64decode(self.rfile.readline().strip()).decode()
                 self.line("334 UGFzc3dvcmQ6")
                 p = base64.b64decode(self.rfile.readline().strip()).decode()
-                if STORE.authenticate(u, p)[0] and "*" not in u:
+                if STORE.authenticate(u, p, self.client_address[0])[0] and "*" not in u:
                     user = u
                     self.line("235 ok")
                 else:

@@ -20,17 +20,21 @@ from urllib.parse import parse_qs, quote, urlparse
 
 from . import __version__
 from .edition import Edition
-from .mail import dnscheck
+from .mail import assistant, dnscheck
+from .mail.sanitize import sanitize_html
 from .mail.antivirus import ClamAV, ScannerUnavailable, VirusFound
 from .mail.filepolicy import FilePolicy
-from .accounts import AccountDB, AccountError, LimitReached, NotLicensed
+from .accounts import AccountDB, AccountError, LimitReached, NotLicensed, PoliciesRequired, hash_password
+from . import policies
 from .licensing import LicenseError, LicenseManager, parse_key
+from .integrity import IntegrityMonitor
 from .mailserver import BundledMailServer, ExternalMailServer
 from .importer import ImportJob, run_import
 from . import migration
 from .mail.imap import AuthError, IMAPAccount, MailError
 from .mail.smtp import SMTPSender, build_message
-from .store import UserStore
+from .store import SiteSettings, UserStore, valid_timezone
+from . import reminders, totp
 
 log = logging.getLogger("zoltis")
 WEB_DIR = os.environ.get("ZOLTIS_WEB_DIR") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
@@ -56,6 +60,8 @@ class Session:
         self.password = password
         self.ip, self.ua = ip, (ua or "")[:200]
         self.created = self.seen = time.time()
+        self.pending_totp = None   # secret being set up, until the first code confirms it
+        self.no_categories = False # set when the mail server can't store category keywords
 
 
 class SessionManager:
@@ -162,26 +168,42 @@ class App:
     def __init__(self, cfg):
         self.cfg = cfg
         data_dir = cfg.get("server", "data_dir")
+        self.data_dir = data_dir
         os.makedirs(data_dir, exist_ok=True)
         self.store = UserStore(data_dir)
         self.sessions = SessionManager(cfg.getint("server", "session_hours"))
         self.login_limiter = RateLimiter(10, 900)
+        self.pending_logins: dict[str, dict] = {}   # 2-step verification: password OK, waiting for the code
+        self.pending_lock = threading.Lock()
         self.edition = Edition(cfg)
+        self.app_name = self.edition.app_name(cfg.get("branding", "app_name"))
+        wanted = (cfg.get("branding", "app_name") or "").strip()
+        if wanted and wanted != self.app_name:
+            log.warning("branding: '%s' ignored. Community Edition always shows the Zoltis Mail name and logo "
+                        "(custom branding is an Enterprise feature)", wanted)
         self.av = ClamAV(cfg)
         self.policy = FilePolicy(cfg)
         ms = lambda k, d="": os.environ.get(f"ZOLTIS_MAIL_SERVER_{k.upper()}") or cfg.raw.get("mail_server", {}).get(k) or d
         self.mode = ms("mode", "external").lower()
         self.license = LicenseManager(cfg, data_dir)
+        self.license.edition = self.edition.name
+        self.license.on_change = self._on_license_change
         self.accounts = AccountDB(os.path.join(data_dir, "accounts.db"), self.edition.limits, self.mode, self.license)
+        if self.edition.name == "community":      # the admin must accept the Community Edition policies
+            self.accounts.policy_version = policies.VERSION
         self.mailserver = BundledMailServer(cfg, data_dir) if self.mode == "bundled" else ExternalMailServer()
         self.public_ip = ms("public_ip", "")
+        self.license.public_ip = self.public_ip or None
+        # Code integrity: changed core files lock the service (when enforced) and are reported at check-in
+        self.site = SiteSettings(data_dir)
+        self.integrity = IntegrityMonitor(cfg, self.license, WEB_DIR)
         self.jobs: dict[str, ImportJob] = {}
         self.migrations: dict[str, migration.MigrationJob] = {}
         self.export_dir = os.path.join(data_dir, "exports")
         os.makedirs(self.export_dir, mode=0o700, exist_ok=True)
         self.setup_token = None
         if self.mode == "bundled":
-            self.mailserver.apply(self.accounts.snapshot())
+            self._apply()
             if self.accounts.count() == 0:
                 tok_path = os.path.join(data_dir, "setup.token")
                 if os.path.exists(tok_path):
@@ -216,7 +238,9 @@ class App:
     def _routes(self):
         r = self.router
         r.add("GET", "/api/config", self.api_config, auth=False)
+        r.add("GET", "/api/client", self.api_client_discovery, auth=False)
         r.add("POST", "/api/login", self.api_login, auth=False)
+        r.add("POST", "/api/login/2fa", self.api_login_2fa, auth=False)
         r.add("POST", "/api/logout", self.api_logout)
         r.add("GET", "/api/me", self.api_me)
         r.add("GET", "/api/folders", self.api_folders)
@@ -230,6 +254,8 @@ class App:
         r.add("POST", "/api/messages/move", self.api_move)
         r.add("POST", "/api/messages/delete", self.api_delete)
         r.add("POST", "/api/messages/restore", self.api_restore)
+        r.add("POST", "/api/messages/category", self.api_set_category)
+        r.add("POST", "/api/folders/empty", self.api_folder_empty)
         r.add("POST", "/api/send", self.api_send)
         r.add("POST", "/api/draft", self.api_draft)
         r.add("GET", "/api/settings", self.api_settings_get)
@@ -243,6 +269,15 @@ class App:
         r.add("POST", "/api/setup", self.api_setup, auth=False)
         r.add("POST", "/api/account/password", self.api_change_password)
         r.add("GET", "/api/account/quota", self.api_my_quota)
+        r.add("GET", "/api/account/security", self.api_security)
+        r.add("POST", "/api/account/2fa/start", self.api_2fa_start)
+        r.add("POST", "/api/account/2fa/enable", self.api_2fa_enable)
+        r.add("POST", "/api/account/2fa/disable", self.api_2fa_disable)
+        r.add("POST", "/api/account/2fa/recovery", self.api_2fa_recovery)
+        r.add("POST", "/api/account/app-password", self.api_app_password)
+        r.add("POST", "/api/account/app-password/delete", self.api_app_password_delete)
+        r.add("GET", "/api/account/mail-setup", self.api_mail_setup)
+        r.add("GET", "/api/account/apple-profile", self.api_apple_profile)
         a = lambda m, p, h: r.add(m, p, self._admin(h))
         a("GET", "/api/admin/overview", self.adm_overview)
         a("GET", "/api/admin/accounts", self.adm_accounts)
@@ -252,6 +287,11 @@ class App:
         a("GET", "/api/admin/domains", self.adm_domains)
         a("POST", "/api/admin/domains", self.adm_domain_add)
         a("POST", "/api/admin/domains/delete", self.adm_domain_delete)
+        a("POST", "/api/admin/domains/mta-sts", self.adm_mta_sts)
+        a("POST", "/api/admin/timezone", self.adm_timezone)
+        a("GET", "/api/admin/policies", self.adm_policies)
+        a("POST", "/api/admin/policies/accept", self.adm_policies_accept)
+        r.add("GET", "/api/internal/tls-allowed", self.api_tls_allowed, auth=False)
         a("GET", "/api/admin/dns-check", self.adm_dns_check)
         a("GET", "/api/admin/aliases", self.adm_aliases)
         a("POST", "/api/admin/aliases", self.adm_alias_set)
@@ -274,11 +314,35 @@ class App:
 
     def api_config(self, req, s):
         b = lambda k: self.cfg.get("branding", k)
-        return {"app_name": b("app_name"), "company": b("company"), "primary_color": b("primary_color"),
+        brand = self.edition.custom_branding
+        return {"app_name": self.app_name, "custom_branding": brand, "company": b("company") if brand else "",
+                "primary_color": b("primary_color") if brand else "",
                 "default_domain": b("default_domain"), "version": __version__,
                 "max_upload_mb": self.cfg.getint("server", "max_upload_mb"),
                 "antivirus": self.av.enabled, "attachments": self.policy.public(), "mail_mode": self.mode,
-                "setup_needed": bool(self.setup_token), "license": self.license.public(), **self.edition.public()}
+                "setup_needed": bool(self.setup_token), "license": self.license.public(),
+                "policies": policies.public() if self.accounts.policy_version else None,
+                "server_time": self._server_time(), **self.edition.public()}
+
+    def api_client_discovery(self, req, s):
+        """What the Zoltis Mail app (and other clients) need to connect to this server.
+
+        Also served at /.well-known/zoltis-mail.json, so the app only needs the server address.
+        """
+        out = {"service": "zoltis-mail", "api_version": 1, "version": __version__,
+               "app_name": self.app_name,
+               "edition": self.edition.public().get("edition", "community"), "mail_mode": self.mode,
+               "auth": {"login": "/api/login", "two_factor": "/api/login/2fa", "logout": "/api/logout",
+                        "scheme": "Bearer", "login_body": {"client": "app"},
+                        "csrf_header": {"X-Zoltis": "1"},
+                        "token_lifetime_seconds": self.cfg.getint("server", "session_hours") * 3600},
+               "features": {"two_factor": self.mode == "bundled", "app_passwords": self.mode == "bundled"},
+               "icon": "/img/icon-512.png"}
+        if self.mode == "bundled":
+            host = self.mailserver.hostname
+            out["imap"] = {"host": host, "port": 993, "security": "ssl"}
+            out["smtp"] = {"host": host, "port": 587, "security": "starttls", "alt_port": 465, "alt_security": "ssl"}
+        return out
 
     def api_login(self, req, s):
         body = req.json()
@@ -294,6 +358,8 @@ class App:
         allowed = self.cfg.getlist("branding", "allowed_domains")
         if allowed and domain not in allowed:
             raise HTTPError(403, "This domain is not allowed on this server")
+        if self.license.locked:
+            raise HTTPError(423, self.license.lock_message)
         ip_key, user_key = "ip:" + req.client_ip(), "u:" + email.lower()
         if self.login_limiter.blocked(ip_key) or self.login_limiter.blocked(user_key):
             raise HTTPError(429, "Too many failed sign-in attempts. Wait a few minutes and try again.")
@@ -316,12 +382,93 @@ class App:
             except AccountError as e:
                 acct.close()
                 raise HTTPError(403, str(e))
+        rec = self.accounts.get(email) if self.mode == "bundled" else None
+        if rec and rec.get("totp_secret"):
+            ticket = secrets.token_urlsafe(32)
+            with self.pending_lock:
+                self._prune_pending()
+                self.pending_logins[ticket] = {"email": email, "acct": acct, "password": password,
+                                               "ip": req.client_ip(), "expires": time.time() + 300,
+                                               "app": self._is_app_client(req, body)}
+            log.info("password ok for %s from %s, waiting for the 2-step verification code", email, req.client_ip())
+            return {"ok": True, "email": email, "twofa_required": True, "ticket": ticket}
+        return self._start_session(req, email, acct, password, self._is_app_client(req, body))
+
+    @staticmethod
+    def _is_app_client(req, body) -> bool:
+        """The Zoltis Mail phone/desktop app (or another API client) signs in with
+        {"client": "app"} or the X-Zoltis-Client header, and gets a bearer token instead of a cookie."""
+        return str(body.get("client") or req.headers.get("X-Zoltis-Client") or "").lower() in ("app", "api")
+
+    def _start_session(self, req, email, acct, password, app_client=False):
         self.accounts.record_login(email)
         sess = Session(email, acct, password, req.client_ip(), req.headers.get("User-Agent", ""))
         self.sessions.add(sess)
-        req.set_cookie("zm_sid", sess.id, max_age=self.cfg.getint("server", "session_hours") * 3600)
-        log.info("login ok for %s from %s", email, req.client_ip())
+        hours = self.cfg.getint("server", "session_hours")
+        log.info("login ok for %s from %s%s", email, req.client_ip(), " (app)" if app_client else "")
+        if app_client:
+            # Sent as "Authorization: Bearer <token>" on every API request.
+            return {"ok": True, "email": email, "token": sess.id, "token_type": "Bearer",
+                    "expires_in": hours * 3600}
+        req.set_cookie("zm_sid", sess.id, max_age=hours * 3600)
         return {"ok": True, "email": email}
+
+    def _prune_pending(self):
+        now = time.time()
+        for t, p in list(self.pending_logins.items()):
+            if p["expires"] < now:
+                self.pending_logins.pop(t, None)
+                p["acct"].close()
+
+    def _check_second_factor(self, email, code) -> str | None:
+        """Accept an authenticator code or a recovery code. Returns which one matched."""
+        rec = self.accounts.get(email) or {}
+        secret = rec.get("totp_secret")
+        if not secret:
+            return None
+        code = "".join(str(code or "").split())
+        if code.isdigit():
+            step = totp.verify(secret, code, rec.get("totp_last") or -1)
+            if step is not None and self.accounts.use_totp_step(email, step):
+                return "totp"
+            return None
+        if totp.normalize_recovery(code):
+            left = self.accounts.use_recovery_code(email, totp.hash_recovery(code))
+            if left is not None:
+                log.warning("%s signed in with a recovery code (%d left)", email, left)
+                return "recovery"
+        return None
+
+    def api_login_2fa(self, req, s):
+        b = req.json()
+        ticket = str(b.get("ticket") or "")
+        with self.pending_lock:
+            self._prune_pending()
+            p = self.pending_logins.get(ticket)
+        if not p:
+            raise HTTPError(401, "Your sign-in expired. Enter your password again.")
+        email = p["email"]
+        if self.license.locked:
+            raise HTTPError(423, self.license.lock_message)
+        ip_key, user_key = "ip:" + req.client_ip(), "2fa:" + email.lower()
+        if self.login_limiter.blocked(ip_key) or self.login_limiter.blocked(user_key):
+            raise HTTPError(429, "Too many wrong codes. Wait a few minutes and try again.")
+        how = self._check_second_factor(email, b.get("code"))
+        if not how:
+            self.login_limiter.fail(ip_key)
+            self.login_limiter.fail(user_key)
+            log.warning("wrong 2-step verification code for %s from %s", email, req.client_ip())
+            raise HTTPError(401, "Wrong code. Try again.")
+        with self.pending_lock:
+            p = self.pending_logins.pop(ticket, None)
+        if not p:
+            raise HTTPError(401, "Your sign-in expired. Enter your password again.")
+        self.login_limiter.reset(user_key)
+        out = self._start_session(req, email, p["acct"], p["password"], p.get("app", False))
+        if how == "recovery":
+            rec = self.accounts.get(email) or {}
+            out["recovery_left"] = len([c for c in (rec.get("recovery_codes") or "").split(",") if c])
+        return out
 
     def api_logout(self, req, s):
         self.sessions.drop(s.id)
@@ -357,13 +504,68 @@ class App:
         page = max(0, int(req.q("page") or 0))
         settings = self.store.load(s.email)["settings"]
         size = min(200, max(10, int(req.q("size") or settings["page_size"])))
-        return s.account.list_messages(folder, page, size, req.q("q") or "")
+        query = req.q("q") or ""
+        cat = (req.q("category") or "").lower()
+        tabs = settings["inbox_tabs"] and folder.upper() == "INBOX" and not query and not s.no_categories
+        if tabs:
+            d = self.store.load(s.email)
+            contacts = d["contacts"]
+            try:
+                s.account.categorize(folder, lambda a: a in contacts, d["sender_categories"])
+            except MailError as e:                 # e.g. an external server without IMAP keywords
+                log.info("inbox categories off for %s: %s", s.email, e)
+                s.no_categories, tabs = True, False
+        if not tabs or cat not in assistant.CATEGORIES:
+            cat = ""
+        r = s.account.list_messages(folder, page, size, query, cat)
+        if tabs:
+            r["categories"] = s.account.category_unread(folder)
+            r["category"] = cat or None
+        return r
+
+    def api_set_category(self, req, s):
+        """Move messages to another inbox tab; with learn, future mail from those senders goes there too."""
+        b = req.json()
+        folder, cat = b.get("folder") or "INBOX", str(b.get("category") or "")
+        if cat not in assistant.CATEGORIES:
+            raise HTTPError(400, "Unknown category")
+        uids = self._uids(b)
+        s.account.set_category(folder, uids, cat)
+        senders = sorted({str(x).strip().lower() for x in b.get("senders", []) if EMAIL_RE.match(str(x).strip())})[:50]
+        if b.get("learn") and senders:
+            self.store.set_sender_category(s.email, senders, cat)
+            for snd in senders:
+                more = [u for u in s.account.uids_from(folder, snd) if u not in uids]
+                s.account.set_category(folder, more, cat)
+        return {"ok": True, "learned": senders if b.get("learn") else []}
+
+    def api_folder_empty(self, req, s):
+        """Empty Trash or Spam now (permanently deletes every message in it)."""
+        folder = req.json().get("folder") or ""
+        roles = {f["name"]: f["role"] for f in s.account.folders(with_counts=False)}
+        if roles.get(folder) not in ("trash", "junk"):
+            raise HTTPError(400, "Only Trash and Spam can be emptied")
+        uids = s.account.all_uids(folder)
+        for i in range(0, len(uids), 1000):
+            s.account.purge(folder, uids[i:i + 1000])
+        return {"ok": True, "deleted": len(uids)}
 
     def api_message(self, req, s):
         folder, uid = req.q("folder"), int(req.q("uid") or 0)
         allow = req.q("images") == "1" or self.store.load(s.email)["settings"]["load_images"] == "always"
-        inspect = self.policy.check if self.policy.apply_incoming else None
-        return s.account.get_message(folder, uid, allow_remote=allow, mark_seen=req.q("peek") != "1", inspect=inspect)
+        junk = folder == s.account.role_folder("junk")
+        if junk:
+            allow = req.q("images") == "1"           # never load remote images automatically from Spam
+        inspect = self.policy.check if (self.policy.apply_incoming or junk) else None
+        m = s.account.get_message(folder, uid, allow_remote=allow, mark_seen=req.q("peek") != "1" and not junk, inspect=inspect)
+        if junk:      # shown as a warning before the message is displayed
+            m["spam_check"] = assistant.spam_check(m.get("html"), m.get("text"), m.get("attachments"), m.get("from"))
+        if self.store.load(s.email)["settings"]["smart_summary"]:
+            try:
+                m["assistant"] = assistant.summarize(m.get("text") or "", m.get("subject") or "", m.get("attachments"))
+            except Exception:  # noqa: BLE001  - a summary must never break reading mail
+                log.exception("summary failed")
+        return m
 
     def api_raw(self, req, s):
         raw = s.account.get_raw(req.q("folder"), int(req.q("uid") or 0))
@@ -371,6 +573,10 @@ class App:
 
     def api_attachment(self, req, s):
         name, ctype, data = s.account.get_attachment(req.q("folder"), int(req.q("uid") or 0), int(req.q("part") or -1))
+        if req.q("folder") == s.account.role_folder("junk"):
+            ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+            if ext in assistant.RESTRICTED_EXT or self.policy.check(name, data)["verdict"] != "allow":
+                raise HTTPError(403, f"\"{name}\" can't be downloaded from Spam. If you trust the sender, mark the message as not spam first.")
         if self.policy.apply_incoming:
             pr = self.policy.check(name, data)
             if pr["verdict"] == "block" and self.policy.incoming_action == "block":
@@ -509,7 +715,10 @@ class App:
         return self.store.load(s.email)["settings"]
 
     def api_settings_set(self, req, s):
-        return self.store.update_settings(s.email, req.json())
+        patch = req.json()
+        if isinstance(patch.get("signature"), str):     # HTML signature: no scripts, forms or tracking tricks
+            patch["signature"] = sanitize_html(patch["signature"][:10000], allow_remote=True)[0].strip()
+        return self.store.update_settings(s.email, patch)
 
     def api_contacts(self, req, s):
         return {"contacts": self.store.search_contacts(s.email, req.q("q") or "")}
@@ -560,7 +769,44 @@ class App:
 
     # ---------------------------------------------------------------- setup & self-service
     def _apply(self):
-        self.mailserver.apply(self.accounts.snapshot())
+        self.mailserver.apply(self.accounts.snapshot(), suspended=self.license.locked)
+
+    def _on_license_change(self, locked: bool):
+        """Managed plan suspended for non-payment, or program files modified (or restored): lock or unlock every sign-in."""
+        if not hasattr(self, "integrity"):
+            return   # still starting up; the first _apply() uses the current state
+        if self.mode == "bundled":
+            self._apply()
+        if locked:
+            for sess in self.sessions.all():
+                self.sessions.drop(sess.id)
+        if self.license.integrity_locked:
+            self.accounts.audit("integrity-check", "service.locked_modified",
+                                ", ".join((self.license.integrity or {}).get("files") or [])[:500])
+        else:
+            self.accounts.audit("licensing-portal", "service.suspended" if locked else "service.restored", "")
+
+    def _server_time(self) -> dict:
+        tz, configured = self.site.timezone()
+        return {"now": time.time(), "timezone": tz, "configured": configured}
+
+    def _set_timezone(self, tz, actor):
+        tz = (tz or "").strip()
+        if not valid_timezone(tz):
+            raise HTTPError(400, "Choose a valid time zone, e.g. Asia/Dubai")
+        self.site.update(timezone=tz, timezone_set_by=actor, timezone_set_at=int(time.time()))
+        self.accounts.audit(actor, "server.timezone", tz)
+
+    def _send_reminders(self):
+        try:
+            reminders.run(self)
+        except Exception:  # noqa: BLE001
+            log.exception("license reminder failed")
+
+    def _reminder_loop(self):
+        while True:
+            self._send_reminders()
+            time.sleep(3600)
 
     def api_setup_status(self, req, s):
         return {"needed": bool(self.setup_token), "mode": self.mode, "license": self.license.public()}
@@ -577,6 +823,8 @@ class App:
             raise HTTPError(429, "Too many attempts. Wait a few minutes.")
         email = (b.get("email") or "").strip().lower()
         domain = email.split("@")[-1] if "@" in email else ""
+        if self.accounts.policy_version and str(b.get("accept_policies") or "") != self.accounts.policy_version:
+            raise HTTPError(400, f"Read and accept the {policies.TITLE} to continue")
         key = "".join(str(b.get("license_key") or "").split())
         if self.license.enabled and (key or not self.license.active):
             if not key:
@@ -589,6 +837,10 @@ class App:
                 self.license.activate(key)
             except LicenseError as e:
                 raise HTTPError(400, str(e))
+        if "@" not in email:
+            raise HTTPError(400, "Enter a full email address, e.g. admin@yourcompany.com")
+        if not self.accounts.policy_status()["accepted"]:
+            self.accounts.accept_policies(self.accounts.policy_version, email, req.client_ip())
         try:
             if not self.accounts.domain(domain):
                 self.accounts.add_domain(domain, actor="setup")
@@ -604,7 +856,11 @@ class App:
             os.remove(os.path.join(self.cfg.get("server", "data_dir"), "setup.token"))
         except OSError:
             pass
+        tz = str(b.get("timezone") or "")
+        if valid_timezone(tz):          # the administrator's local time zone becomes the server time
+            self._set_timezone(tz, email)
         log.info("first-run setup completed: admin %s", email)
+        threading.Thread(target=self._send_reminders, daemon=True).start()   # "add your key within 7 days"
         return {"ok": True, "email": email}
 
     def api_change_password(self, req, s):
@@ -630,6 +886,136 @@ class App:
             q = None
         return {"quota": q}
 
+    # ---------------------------------------------------------------- 2-step verification, app passwords
+    def _bundled_only(self):
+        if self.mode != "bundled":
+            raise HTTPError(400, "Two-step verification and app passwords are managed by your mail server administrator")
+
+    def _confirm_password(self, s, b):
+        key = "pw:" + s.email.lower()
+        if self.login_limiter.blocked(key):
+            raise HTTPError(429, "Too many wrong passwords. Wait a few minutes and try again.")
+        if not secrets.compare_digest(str(b.get("password") or "").encode(), s.password.encode()):
+            self.login_limiter.fail(key)
+            raise HTTPError(403, "Your password is incorrect")
+
+    def api_security(self, req, s):
+        rec = self.accounts.get(s.email) or {}
+        return {"available": self.mode == "bundled", "twofa": bool(rec.get("totp_secret")),
+                "recovery_left": len([c for c in (rec.get("recovery_codes") or "").split(",") if c]),
+                "app_password": bool(rec.get("app_pw_hash")), "app_password_created": rec.get("app_pw_created")}
+
+    def api_2fa_start(self, req, s):
+        self._bundled_only()
+        self._confirm_password(s, req.json())
+        if (self.accounts.get(s.email) or {}).get("totp_secret"):
+            raise HTTPError(409, "Two-step verification is already on")
+        s.pending_totp = totp.new_secret()
+        issuer = self.app_name
+        return {"secret": s.pending_totp, "uri": totp.otpauth_uri(s.pending_totp, s.email, issuer)}
+
+    def api_2fa_enable(self, req, s):
+        self._bundled_only()
+        if not s.pending_totp:
+            raise HTTPError(400, "Start the setup again")
+        step = totp.verify(s.pending_totp, req.json().get("code"))
+        if step is None:
+            raise HTTPError(400, "That code isn't right. Check the time on your phone and try the newest code.")
+        codes = totp.new_recovery_codes()
+        self.accounts.set_totp(s.email, s.pending_totp, [totp.hash_recovery(c) for c in codes], actor=s.email)
+        self.accounts.use_totp_step(s.email, step)
+        s.pending_totp = None
+        self._apply()
+        self.sessions.drop_user(s.email, keep=s.id)
+        log.info("2-step verification turned on for %s", s.email)
+        return {"ok": True, "recovery_codes": codes}
+
+    def api_2fa_disable(self, req, s):
+        self._bundled_only()
+        self._confirm_password(s, req.json())
+        self.accounts.set_totp(s.email, None, actor=s.email)
+        self._apply()
+        log.info("2-step verification turned off for %s", s.email)
+        return {"ok": True}
+
+    def api_2fa_recovery(self, req, s):
+        self._bundled_only()
+        self._confirm_password(s, req.json())
+        if not (self.accounts.get(s.email) or {}).get("totp_secret"):
+            raise HTTPError(400, "Two-step verification is off")
+        codes = totp.new_recovery_codes()
+        self.accounts.set_recovery_codes(s.email, [totp.hash_recovery(c) for c in codes])
+        self.accounts.audit(s.email, "account.2fa.recovery_new", s.email)
+        return {"ok": True, "recovery_codes": codes}
+
+    def api_app_password(self, req, s):
+        self._bundled_only()
+        self._confirm_password(s, req.json())
+        pw = totp.new_app_password()
+        self.accounts.set_app_password(s.email, hash_password(pw), actor=s.email)
+        self._apply()
+        return {"ok": True, "app_password": pw}
+
+    def api_app_password_delete(self, req, s):
+        self._bundled_only()
+        self.accounts.set_app_password(s.email, None, actor=s.email)
+        self._apply()
+        return {"ok": True}
+
+    def api_mail_setup(self, req, s):
+        domain = s.email.split("@")[1].lower()
+        rec = self.accounts.get(s.email) or {}
+        if self.mode == "bundled":
+            host = self.mailserver.hostname
+            imap = {"host": host, "port": 993, "security": "SSL/TLS"}
+            smtp = {"host": host, "port": 587, "security": "STARTTLS", "alt_port": 465, "alt_security": "SSL/TLS"}
+        else:
+            i, o = self._server_for("imap", domain), self._server_for("smtp", domain)
+            sec = {"ssl": "SSL/TLS", "starttls": "STARTTLS", "plain": "None"}
+            imap = {"host": i["host"], "port": i["port"], "security": sec.get(i["security"], i["security"])}
+            smtp = {"host": o["host"], "port": o["port"], "security": sec.get(o["security"], o["security"])}
+        return {"email": s.email, "name": rec.get("name") or self.store.load(s.email)["settings"].get("display_name") or "",
+                "username": s.email, "imap": imap, "smtp": smtp, "twofa": bool(rec.get("totp_secret")),
+                "app_password": bool(rec.get("app_pw_hash")), "profile": self.mode == "bundled"}
+
+    def api_apple_profile(self, req, s):
+        """iPhone / iPad / Mac configuration profile: sets up the account in Apple Mail in one tap.
+
+        The password isn't included: the device asks for it while installing.
+        """
+        if self.mode != "bundled":
+            raise HTTPError(400, "Not available for this server")
+        import plistlib
+        import uuid
+        info = self.api_mail_setup(req, s)
+        app = self.app_name
+        host = self.mailserver.hostname
+        base = f"zoltis.{host}.{s.email}"
+        mail = {
+            "PayloadType": "com.apple.mail.managed", "PayloadVersion": 1,
+            "PayloadIdentifier": base + ".mail", "PayloadUUID": str(uuid.uuid5(uuid.NAMESPACE_DNS, base + ".mail")).upper(),
+            "PayloadDisplayName": s.email, "PayloadDescription": f"Email account {s.email}",
+            "EmailAccountDescription": f"{s.email}", "EmailAccountName": info["name"] or s.email.split("@")[0],
+            "EmailAccountType": "EmailTypeIMAP", "EmailAddress": s.email,
+            "IncomingMailServerHostName": host, "IncomingMailServerPortNumber": 993, "IncomingMailServerUseSSL": True,
+            "IncomingMailServerUsername": s.email, "IncomingMailServerAuthentication": "EmailAuthPassword",
+            "OutgoingMailServerHostName": host, "OutgoingMailServerPortNumber": 587, "OutgoingMailServerUseSSL": True,
+            "OutgoingMailServerUsername": s.email, "OutgoingMailServerAuthentication": "EmailAuthPassword",
+            "OutgoingPasswordSameAsIncomingPassword": True, "SMIMEEnabled": False,
+            "PreventMove": False, "PreventAppSheet": False, "disableMailRecentsSyncing": False,
+        }
+        profile = {
+            "PayloadType": "Configuration", "PayloadVersion": 1, "PayloadContent": [mail],
+            "PayloadIdentifier": base, "PayloadUUID": str(uuid.uuid5(uuid.NAMESPACE_DNS, base)).upper(),
+            "PayloadDisplayName": f"{app}: {s.email}", "PayloadOrganization": app,
+            "PayloadDescription": "Adds your email account to the Mail app. You'll be asked for your password "
+                                  "(your app password if two-step verification is on).",
+            "PayloadRemovalDisallowed": False,
+        }
+        data = plistlib.dumps(profile, fmt=plistlib.FMT_XML)
+        fname = re.sub(r"[^A-Za-z0-9._@-]", "_", s.email) + ".mobileconfig"
+        req.send_bytes(data, "application/x-apple-aspen-config", {"Content-Disposition": f'attachment; filename="{fname}"'})
+
     # ---------------------------------------------------------------- admin console
     def _admin(self, fn):
         def wrapped(req, s):
@@ -639,6 +1025,8 @@ class App:
                 return fn(req, s)
             except LimitReached as e:
                 raise HTTPError(402, str(e))
+            except PoliciesRequired as e:
+                raise HTTPError(428, str(e))
             except NotLicensed as e:
                 raise HTTPError(403, str(e))
             except AccountError as e:
@@ -650,6 +1038,8 @@ class App:
         lim = self.edition.limits
         return {
             "edition": self.edition.name, "mode": self.mode, "limits": lim, "license": self.license.public(full=True),
+            "policies": {**policies.public(), **self.accounts.policy_status()},
+            "server_time": self._server_time(),
             "accounts": len(accts), "admins": sum(1 for a in accts if a["is_admin"]),
             "aliases_counted": self.accounts.alias_count(),
             "disabled": sum(1 for a in accts if not a["enabled"]),
@@ -662,7 +1052,7 @@ class App:
         }
 
     def adm_license(self, req, s):
-        return self.license.public(full=True)
+        return {**self.license.public(full=True), "integrity": self.integrity.public()}
 
     def adm_license_activate(self, req, s):
         try:
@@ -711,6 +1101,12 @@ class App:
             raise HTTPError(400, "You can't remove your own admin rights or disable yourself")
         allowed = {k: b[k] for k in ("name", "quota_mb", "is_admin", "enabled", "password") if k in b}
         a = self.accounts.update_account(email, actor=s.email, **allowed)
+        if b.get("reset_2fa"):
+            if not self.accounts.get(email):
+                raise HTTPError(404, "Account not found")
+            self.accounts.set_totp(email, None, actor=s.email)
+            self.accounts.set_app_password(email, None, actor=s.email)
+            a = self.accounts.update_account(email, actor=s.email)
         self._apply()
         if allowed.get("password") or allowed.get("enabled") is False:
             self.sessions.drop_user(email, keep=s.id if email.lower() == s.email.lower() else None)
@@ -761,6 +1157,44 @@ class App:
         self.accounts.delete_domain(req.json().get("name", ""), actor=s.email)
         self._apply()
         return {"ok": True}
+
+    def adm_timezone(self, req, s):
+        self._set_timezone(req.json().get("timezone"), s.email)
+        return self._server_time()
+
+    def adm_policies(self, req, s):
+        return {**policies.public(), **self.accounts.policy_status()}
+
+    def adm_policies_accept(self, req, s):
+        self.accounts.accept_policies(str(req.json().get("version") or ""), s.email, req.client_ip())
+        return self.adm_policies(req, s)
+
+    def adm_mta_sts(self, req, s):
+        b = req.json()
+        return self.accounts.set_mta_sts((b.get("name") or "").strip().lower(), b.get("mode", ""), actor=s.email)
+
+    # ---------------------------------------------------------------- MTA-STS (public)
+    def _sts_domain(self, host):
+        host = (host or "").split(":")[0].strip().lower().rstrip(".")
+        if self.mode != "bundled" or not host.startswith("mta-sts."):
+            return None
+        d = self.accounts.domain(host[8:])
+        return d if d and (d.get("mta_sts") or "testing") != "off" else None
+
+    def api_tls_allowed(self, req, s):
+        """Caddy asks this before fetching an on-demand certificate for mta-sts.<domain>."""
+        if not self._sts_domain(req.q("domain")):
+            raise HTTPError(404, "Not a hosted MTA-STS name")
+        return {"ok": True}
+
+    def mta_sts_policy(self, host):
+        """https://mta-sts.<domain>/.well-known/mta-sts.txt (RFC 8461)."""
+        d = self._sts_domain(host)
+        if not d:
+            return 404, b"Not found\n"
+        mode = d.get("mta_sts") or "testing"
+        age = 604800 if mode == "enforce" else 86400
+        return 200, f"version: STSv1\r\nmode: {mode}\r\nmx: {self.mailserver.hostname}\r\nmax_age: {age}\r\n".encode()
 
     def adm_dns_check(self, req, s):
         domain = (req.q("domain") or "").lower()
@@ -1021,7 +1455,7 @@ def make_handler(app: App):
             for k, v in SECURITY_HEADERS.items():
                 self.send_header(k, v)
             if behind_https:
-                self.send_header("Strict-Transport-Security", "max-age=31536000")
+                self.send_header("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
             for c in self._cookies:
                 self.send_header("Set-Cookie", c)
             for k, v in (extra or {}).items():
@@ -1069,6 +1503,11 @@ def make_handler(app: App):
             path = u.path
             if path == "/healthz":
                 return self._send(200, b"ok", "text/plain")
+            if path == "/.well-known/mta-sts.txt" and self.command in ("GET", "HEAD"):
+                code, body = app.mta_sts_policy(self.headers.get("Host"))
+                return self._send(code, body, "text/plain; charset=utf-8")
+            if path == "/.well-known/zoltis-mail.json" and self.command in ("GET", "HEAD"):
+                return self.send_json(app.api_client_discovery(self, None))
             if not path.startswith("/api/"):
                 if self.command not in ("GET", "HEAD"):
                     return self._send(405, b"", "text/plain")
@@ -1092,6 +1531,9 @@ def make_handler(app: App):
                     sess = app.sessions.get(sid)
                     if not sess:
                         raise HTTPError(401, "Please sign in")
+                    if app.license.locked:
+                        app.sessions.drop(sess.id)
+                        raise HTTPError(423, app.license.lock_message)
                 result = handler(self, sess)
                 if not self._sent:
                     self.send_json(result if result is not None else {"ok": True})
@@ -1133,6 +1575,8 @@ def serve(cfg):
     httpd = ThreadingHTTPServer((host, port), make_handler(app))
     httpd.daemon_threads = True
     app.license.start()
+    app.integrity.start()
+    threading.Thread(target=app._reminder_loop, name="license-reminders", daemon=True).start()
     log.info("Zoltis Mail %s (%s edition) listening on http://%s:%d", __version__, app.edition.name, host, port)
     try:
         httpd.serve_forever()

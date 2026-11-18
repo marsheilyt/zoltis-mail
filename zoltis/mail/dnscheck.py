@@ -277,10 +277,13 @@ def run(domain: str, sending_ip: str | None = None, dkim_selector: str | None = 
     else:
         res.append(_check("warn", "Reverse DNS (PTR)", "Could not determine the sending IP. Pass --ip to check it."))
 
-    # MTA-STS / TLS-RPT (nice to have)
+    # MTA-STS / TLS-RPT: make other servers use (and report on) encrypted delivery
     sts = [t for t in query(f"_mta-sts.{domain}", "TXT") if t.lower().startswith("v=stsv1")]
-    res.append(_check("pass" if sts else "warn", "MTA-STS", sts[0] if sts else "Not configured (optional, improves TLS trust).",
-                      "" if sts else "Optional: publish _mta-sts TXT and https://mta-sts.<domain>/.well-known/mta-sts.txt"))
+    res.append(_check("pass" if sts else "warn", "MTA-STS", sts[0] if sts else "Not published: senders may fall back to unencrypted delivery.",
+                      "" if sts else f"Publish the _mta-sts.{domain} TXT and mta-sts.{domain} CNAME records shown in Domains & DNS"))
+    rpt = [t for t in query(f"_smtp._tls.{domain}", "TXT") if t.lower().startswith("v=tlsrptv1")]
+    res.append(_check("pass" if rpt else "warn", "TLS reporting", rpt[0] if rpt else "Not published (you won't hear about failed encrypted deliveries).",
+                      "" if rpt else f"Publish the _smtp._tls.{domain} TXT record shown in Domains & DNS"))
 
     weights = {"pass": 1.0, "warn": 0.5, "fail": 0.0}
     score = round(100 * sum(weights[r["status"]] for r in res) / max(1, len(res)))

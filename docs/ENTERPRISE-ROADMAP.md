@@ -52,10 +52,10 @@ security, and the module system that Enterprise modules plug into (`zoltis.enter
 
 \*For a small team of 2–3 developers. Phases 3–5 can run in parallel.
 
-## Licensing model (decide before publishing on GitHub)
-- **Community:** pick an open-source license. **AGPL-3.0** stops competitors from running your code as a paid hosted
-  service without sharing their changes, which protects the managed Enterprise business. MIT/Apache-2.0 is friendlier for adoption.
+## Licensing model
+- **Community:** source-available under the **Zoltis Mail Community License** (`LICENSE`): free to run unchanged
+  for your own organisation with a license key; changed copies only for private testing; no hosting for others,
+  resale or removing the license check, limits or credit. Have a lawyer review it before the public release.
 - **Enterprise:** not distributed. It runs only on Zoltis infrastructure, so no license keys are needed for customers.
 - Note: in open-source code, the 10-account / 720 MB limits can technically be removed by anyone who edits the code.
   The limits shape the product; the value of Enterprise is that Zoltis manages it.
-- Get legal advice before choosing. `LICENSE` currently says *All rights reserved* until you decide.

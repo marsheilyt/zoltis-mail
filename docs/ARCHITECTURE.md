@@ -4,14 +4,14 @@
  Internet ──▶ caddy (80/443, Let's Encrypt) ──▶ web (Zoltis Mail: webmail + admin console)
           ──▶ postfix (25/465/587) ── LMTP / SASL / quota-status ──▶ dovecot (993)
                                                        ▲                  ▲
- web ── IMAP 143 / master login (private network) ─────┘                  │
- web ── SMTP 10587 (private) ──▶ postfix                                  │
+ web ── IMAP 143 STARTTLS / master login (private) ────┘                  │
+ web ── SMTP 10587 STARTTLS (private) ──▶ postfix                         │
  web ── renders users, maps, DKIM keys ──▶ [mailconf volume] ──▶ postfix + dovecot (watchers reload)
  web ── clamd INSTREAM ──▶ clamav
 ```
 
 All containers share a private Docker network (`172.28.0.0/24`). The web container has the fixed address
-`172.28.0.10`, and only that address may use Dovecot's plaintext port 143 and master login.
+`172.28.0.10`, and only that address may use Dovecot's internal port 143 (STARTTLS, never published) and the master login.
 
 **Single source of truth.** `accounts.db` (SQLite) in the web container stores domains, accounts, aliases and the audit log.
 After every change `zoltis/mailserver.py` renders plain files into the shared `mailconf` volume:

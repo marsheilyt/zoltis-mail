@@ -4,16 +4,39 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#0e1b33">
 <title>Mail</title>
+<link rel="icon" href="/favicon.ico" sizes="48x48">
 <link rel="icon" href="/img/logo.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/img/apple-touch-icon.png">
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="stylesheet" href="/css/app.css">
 </head>
 <body>
 <!-- ============ LOGIN ============ -->
-<div id="login" class="login hidden">
+<div id="login" class="login login-split hidden">
+  <aside class="login-hero" aria-label="About Zoltis Mail">
+    <div class="hero-brand"><img src="/img/logo-dark.svg" alt="" class="hero-logo"><span class="brand-name app-name">Mail</span></div>
+    <div class="hero-copy">
+      <h2 class="hero-title">Business email on your own server</h2>
+      <p class="hero-sub">Your domains, your mailboxes, your data. Familiar webmail with security built in.</p>
+      <ul class="hero-features">
+        <li><span class="fi"><i data-icon="inbox"></i></span><div><b>Webmail that feels familiar</b><span>Fast search, labels, keyboard shortcuts and dark mode</span></div></li>
+        <li><span class="fi"><i data-icon="shield"></i></span><div><b>Protected by default</b><span>2-step verification, app passwords, dangerous attachments and tracking images blocked</span></div></li>
+        <li><span class="fi"><i data-icon="smartphone"></i></span><div><b>Works with every mail app</b><span>iPhone, Android, Outlook and Thunderbird, set up in a minute</span></div></li>
+        <li><span class="fi"><i data-icon="lock"></i></span><div><b>Encrypted connections</b><span>HTTPS for webmail, TLS for apps, DANE and MTA-STS between mail servers</span></div></li>
+        <li><span class="fi"><i data-icon="check"></i></span><div><b>Lands in the inbox</b><span>DKIM, SPF and DMARC set up for every domain</span></div></li>
+      </ul>
+    </div>
+    <div class="hero-clocks" aria-live="off">
+      <div class="clock"><span class="clock-label">Server time</span><b id="clock-server">--:--</b><span class="clock-sub" id="clock-server-sub"></span></div>
+      <div class="clock"><span class="clock-label">Your time</span><b id="clock-local">--:--</b><span class="clock-sub" id="clock-local-sub"></span></div>
+    </div>
+    <p class="clock-note hidden" id="clock-note"></p>
+  </aside>
+  <div class="login-main">
   <form class="login-card" id="login-form" autocomplete="on">
-    <img src="/img/logo.svg" alt="" class="login-logo">
+    <div class="login-brand"><img src="/img/logo.svg" alt="" class="login-logo"><span class="brand-name app-name">Mail</span></div>
     <h1 id="login-title">Sign in</h1>
     <p class="login-sub">to continue to <span class="app-name">Mail</span></p>
     <label class="field">
@@ -30,28 +53,54 @@
       <button class="btn primary" type="submit" id="login-btn">Sign in</button>
     </div>
     <p class="login-foot"><span class="app-name">Mail</span> · <span id="login-edition"></span></p>
+    <p class="credit">Developed and maintained by Zealartis Global Technologies · WY, USA</p>
   </form>
+  <form class="login-card hidden" id="login-2fa-form" autocomplete="off">
+    <div class="login-brand"><img src="/img/logo.svg" alt="" class="login-logo"><span class="brand-name app-name">Mail</span></div>
+    <h1>2-Step Verification</h1>
+    <p class="login-sub" id="login-2fa-sub">Enter the 6-digit code from your authenticator app</p>
+    <label class="field">
+      <input id="login-code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" required placeholder=" " maxlength="20" spellcheck="false">
+      <span>Code</span>
+    </label>
+    <div class="login-error" id="login-2fa-error" role="alert"></div>
+    <p class="muted" style="font-size:12px;margin:-4px 0 16px">Lost your phone? Enter one of your recovery codes instead (like <code>abcde-23456</code>), or ask your administrator to turn off 2-step verification.</p>
+    <div class="login-actions">
+      <button class="btn text" type="button" id="login-2fa-back">Back</button>
+      <button class="btn primary" type="submit" id="login-2fa-btn">Verify</button>
+    </div>
+  </form>
+  </div>
 </div>
 
 <!-- ============ FIRST-RUN SETUP ============ -->
 <div id="setup" class="login hidden">
   <form class="login-card" id="setup-form" autocomplete="off">
-    <img src="/img/logo.svg" alt="" class="login-logo">
+    <div class="login-brand"><img src="/img/logo.svg" alt="" class="login-logo"><span class="brand-name app-name">Mail</span></div>
     <h1>Set up <span class="app-name">Zoltis Mail</span></h1>
     <p class="login-sub">Create the first administrator account. The domain of this address becomes your first mail domain.</p>
     <label class="field"><input id="setup-token" required placeholder=" " autocomplete="one-time-code"><span>Setup code (from the server log)</span></label>
     <div id="setup-license-box">
-      <label class="field"><textarea id="setup-license" rows="3" placeholder=" " spellcheck="false" autocomplete="off"></textarea><span>License key</span></label>
-      <p class="muted" style="font-size:12px;margin:-8px 0 16px">Community Edition is free, but every server needs a license key.
-        <a id="setup-register" href="#" target="_blank" rel="noopener">Register to get your key</a>. Your admin address must be on a domain the key covers.</p>
+      <label class="field"><textarea id="setup-license" rows="3" placeholder=" " spellcheck="false" autocomplete="off"></textarea><span>License key (optional now)</span></label>
+      <p class="muted" style="font-size:12px;margin:-8px 0 16px">Community Edition is free, but every server needs a license key: you can add it now or within 7 days
+        in Admin console → License. Get it at <a id="setup-register" href="#" target="_blank" rel="noopener">zoltismail.com</a> → My account → License keys → Community Edition,
+        entering this server's IP<span id="setup-ip"></span>. Your admin address must be on a domain the key covers.</p>
     </div>
     <label class="field"><input id="setup-name" placeholder=" "><span>Your name</span></label>
-    <label class="field"><input id="setup-email" type="email" required placeholder=" "><span>Admin email (e.g. admin@yourcompany.com)</span></label>
+    <label class="field"><input id="setup-email" type="email" autocomplete="username" required placeholder=" "><span>Admin email (e.g. admin@yourcompany.com)</span></label>
     <label class="field"><input id="setup-password" type="password" required minlength="8" placeholder=" " autocomplete="new-password"><span>Password (8+ characters)</span></label>
     <label class="field"><input id="setup-password2" type="password" required placeholder=" " autocomplete="new-password"><span>Confirm password</span></label>
+    <div id="setup-policies" class="hidden">
+      <h2 class="policy-head">Community Edition policies</h2>
+      <div class="policy-box" id="setup-policy-text" tabindex="0" aria-label="Policies"><div class="loading-bar"></div></div>
+      <label class="policy-accept"><input type="checkbox" id="setup-accept">
+        <span>I have read and accept the <a id="setup-policy-link" href="#" target="_blank" rel="noopener">Zoltis Mail Community Edition policies</a>
+        (version <span id="setup-policy-ver"></span>) and the <a id="setup-terms-link" href="#" target="_blank" rel="noopener">Terms of Service</a>.</span></label>
+    </div>
     <div class="login-error" id="setup-error" role="alert"></div>
     <p class="muted" style="font-size:12px;margin:0 0 16px">Find the setup code with: <code>docker compose logs web | grep SETUP</code></p>
     <div class="login-actions"><span></span><button class="btn primary" type="submit" id="setup-btn">Create admin &amp; continue</button></div>
+    <p class="credit">Developed and maintained by Zealartis Global Technologies · WY, USA</p>
   </form>
 </div>
 
@@ -59,7 +108,7 @@
 <div id="app" class="app hidden">
   <header class="topbar">
     <button class="icon-btn" id="menu-btn" title="Main menu" aria-label="Main menu"><i data-icon="menu"></i></button>
-    <a class="brand" href="#/inbox"><img src="/img/logo.svg" alt=""><span class="app-name">Mail</span></a>
+    <a class="brand" href="#/inbox"><img src="/img/logo.svg" alt=""><span class="brand-name app-name">Mail</span></a>
     <form class="search" id="search-form" role="search">
       <button type="submit" class="icon-btn" title="Search" aria-label="Search"><i data-icon="search"></i></button>
       <input id="search" type="search" placeholder="Search mail" autocomplete="off" aria-label="Search mail">
@@ -85,6 +134,8 @@
       <div class="menu hidden" id="account-menu">
         <div class="acct-head"><span class="avatar big" id="me-avatar2">?</span><div><b id="me-name"></b><div id="me-email" class="muted"></div></div></div>
         <div class="acct-edition" id="me-edition"></div>
+        <button class="menu-item" id="mailapps-link"><i data-icon="smartphone"></i> Set up mail apps</button>
+        <button class="menu-item" id="security-link"><i data-icon="lock"></i> Security &amp; 2-step verification</button>
         <a class="menu-item hidden" id="admin-link" href="#/admin"><i data-icon="shield"></i> Admin console</a>
         <button class="menu-item" id="logout-btn"><i data-icon="logout"></i> Sign out</button>
       </div>
@@ -107,6 +158,7 @@
   <main class="main">
     <!-- list view -->
     <section class="pane" id="list-view">
+      <div class="lic-banner hidden" id="lic-banner" role="status"></div>
       <div class="toolbar">
         <label class="chk-wrap" title="Select"><input type="checkbox" id="select-all" aria-label="Select all"></label>
         <div class="bulk hidden" id="bulk-actions">
@@ -117,6 +169,7 @@
           <button class="icon-btn" data-act="read" title="Mark as read"><i data-icon="drafts"></i></button>
           <button class="icon-btn" data-act="unread" title="Mark as unread"><i data-icon="mail"></i></button>
           <button class="icon-btn" data-act="move" title="Move to"><i data-icon="folder"></i></button>
+          <button class="icon-btn hidden" data-act="category" id="bulk-category" title="Move to tab"><i data-icon="label"></i></button>
         </div>
         <button class="icon-btn" id="refresh-btn" title="Refresh"><i data-icon="refresh"></i></button>
         <div class="spacer"></div>
@@ -124,6 +177,8 @@
         <button class="icon-btn" id="prev-page" title="Newer"><i data-icon="chevron_left"></i></button>
         <button class="icon-btn" id="next-page" title="Older"><i data-icon="chevron_right"></i></button>
       </div>
+      <div class="cat-tabs hidden" id="cat-tabs" role="tablist" aria-label="Inbox categories"></div>
+      <div class="folder-banner hidden" id="folder-banner"></div>
       <div class="search-banner hidden" id="search-banner"></div>
       <div class="list" id="list" role="list"></div>
     </section>
@@ -155,6 +210,7 @@
 <div id="modal-root"></div>
 <div id="popover" class="menu hidden"></div>
 
+<script src="/js/vendor/qrcode.js"></script>
 <script src="/js/icons.js"></script>
 <script src="/js/app.js"></script>
 <script src="/js/admin.js"></script>

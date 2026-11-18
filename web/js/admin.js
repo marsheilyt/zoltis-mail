@@ -48,7 +48,7 @@ async function overview(body, ctx) {
   const srv = o.server || {};
   const ok = (b) => b ? `<span class="badge ok">${icon("check")} Running</span>` : `<span class="badge off">${icon("error")} Unreachable</span>`;
   const synced = srv.synced ? Object.values(srv.synced).every((x) => x !== false) : true;
-  body.innerHTML = `${licenseNote(o.license)}
+  body.innerHTML = `${policiesNote(o.policies)}${licenseNote(o.license)}
     ${o.mode === "bundled" && o.accounts <= 1 ? `<div class="limit-note">${icon("help")}<span><b>Finish setting up your mail server.</b>
       The setup guide walks you through Cloudflare DNS (MX, SPF, DKIM, DMARC), reverse DNS and connecting mail apps.
       <a href="#/admin/guide">Open the setup guide</a></span></div>` : ""}
@@ -71,8 +71,24 @@ async function overview(body, ctx) {
       : `<tr><td>Mode</td><td>External mail server: accounts sign in with their existing mail password</td></tr>`}
       <tr><td>Antivirus (ClamAV)</td><td>${!o.antivirus.enabled ? `<span class="badge">Disabled</span>` : ok(o.antivirus.online)}</td></tr>
       <tr><td>Attachment blocker</td><td>${o.attachment_policy.enabled ? `<span class="badge ok">${icon("shield")} Active</span>` : `<span class="badge">Disabled</span>`}</td></tr>
+      <tr><td>Server time zone</td><td><b>${esc(o.server_time?.timezone || "UTC")}</b> <span class="muted">· shown as "Server time" on the sign-in page</span>
+        <button class="btn text" id="tz-change">Change</button></td></tr>
     </table>
     ${upgradeNote(`<b>Community Edition</b> includes up to ${max} accounts, ${o.limits.max_domains} domains and ${o.limits.max_aliases} aliases, with ${o.limits.max_quota_mb} MB per mailbox.`)}`;
+  $("#tz-change", body).onclick = () => timezoneDialog(o.server_time?.timezone, () => reloadTab(ctx));
+}
+function timezoneDialog(current, done) {
+  let zones = [];
+  try { zones = Intl.supportedValuesOf("timeZone"); } catch (e) {}
+  const mine = Z.browserTz();
+  if (!zones.includes("UTC")) zones.unshift("UTC");
+  modal({ title: "Server time zone", body: `<p class="muted" style="font-size:13px;margin-top:0">Shown as "Server time" on the sign-in page. Your device uses <b>${esc(mine)}</b>.</p>
+      <input class="txt" id="tz-in" list="tz-list" value="${esc(current || mine)}" spellcheck="false" autocomplete="off" style="width:100%">
+      <datalist id="tz-list">${zones.map((z) => `<option value="${esc(z)}">`).join("")}</datalist>`,
+    buttons: [{ label: "Cancel" }, { label: `Use ${mine}`, onClick: async (m) => { $("#tz-in", m).value = mine; return false; } },
+      { label: "Save", cls: "primary", onClick: async (m) => {
+        try { await api("/api/admin/timezone", { method: "POST", body: { timezone: $("#tz-in", m).value.trim() } }); snack("Server time zone saved"); done && done(); }
+        catch (e) { snack(e.message); return false; } } }] });
 }
 
 // ------------------------------------------------------------------ accounts
@@ -98,7 +114,7 @@ async function accounts(body, ctx) {
       const u = a.usage, pct = u ? u.percent : 0;
       const tr = h(`<tr><td><div class="who">${avatar({ name: a.name, email: a.email }, "md")}<div><b>${esc(a.name || a.email.split("@")[0])}</b><span>${esc(a.email)}</span></div></div></td>
         <td class="use">${state.mode === "bundled" ? (u ? `${mb(u.used_mb)} of ${mb(a.quota_mb)}${meter(pct)}` : `<span class="muted">– of ${mb(a.quota_mb)}</span>`) : `<span class="muted">Managed by mail server</span>`}</td>
-        <td class="hide-sm">${a.is_admin ? `<span class="badge admin">Admin</span>` : `<span class="muted">User</span>`}</td>
+        <td class="hide-sm">${a.is_admin ? `<span class="badge admin">Admin</span>` : `<span class="muted">User</span>`}${a.twofa ? ` <span class="badge ok" title="2-step verification is on">2FA</span>` : ""}</td>
         <td>${a.enabled ? `<span class="badge ok">${a.online ? '<span class="dot"></span> Online' : "Active"}</span>` : `<span class="badge off">Disabled</span>`}</td>
         <td class="hide-sm muted">${esc(ago(a.last_login))}</td>
         <td style="text-align:right"><button class="icon-btn sm" title="Actions">${icon("more_vert")}</button></td></tr>`);
@@ -120,6 +136,10 @@ function accountMenu(btn, a, ctx) {
   if (state.mode === "bundled") {
     items.push({ label: "Edit account", icon: "edit", onClick: () => accountForm(a, ctx) });
     items.push({ label: "Reset password", icon: "lock", onClick: () => resetPassword(a, ctx) });
+    if (a.twofa) items.push({ label: "Turn off 2-step verification", icon: "shield", onClick: async () => {
+      if (await Z.ask(`Turn off 2-step verification for ${a.email}?`, "Use this when they lost their phone and recovery codes. Their app password is removed too, so mail apps will need their normal password again. Ask them to turn 2-step verification back on afterwards.", "Turn off", true))
+        update(a.email, { reset_2fa: true }, "2-step verification turned off", ctx);
+    } });
     items.push({ label: "Import mail from old server", icon: "download", onClick: () => { location.hash = "#/admin/import"; state.importTarget = a.email; } });
   }
   if (!me) {
@@ -190,7 +210,7 @@ async function domains(body, ctx) {
   const dmax = r.max_domains, dfull = dmax && r.domains.length >= dmax;
   body.innerHTML = `<div class="adm-tools"><button class="btn primary" id="dom-new" ${dfull ? "disabled" : ""} title="${dfull ? `Limit of ${dmax} domains reached` : ""}">${icon("add")} Add domain</button>
     <span class="count"><b>${r.domains.length}</b> of ${dmax || "∞"} domains${dfull ? ` · <span class="st-warn">limit reached</span> · <a href="#/admin/upgrade">Upgrade to Mail Pro</a>` : ""} · Mail server hostname: <b>${esc(r.mail_hostname || "")}</b></span></div>
-    <div class="limit-note">${icon("help")}<span>Publish these records at your DNS provider. They make mail reach you (MX) and keep your messages out of spam (SPF, DKIM, DMARC). Ask your server provider to set the reverse DNS (PTR) of the server's IP to <b>${esc(r.mail_hostname || "")}</b>.
+    <div class="limit-note">${icon("help")}<span>Publish these records at your DNS provider. They make mail reach you (MX), keep your messages out of spam (SPF, DKIM, DMARC) and make other servers deliver to you encrypted (MTA-STS, TLS reports). Ask your server provider to set the reverse DNS (PTR) of the server's IP to <b>${esc(r.mail_hostname || "")}</b>.
       Using Cloudflare? The <a href="#/admin/guide">setup guide</a> shows each record exactly as Cloudflare asks for it. A records must be <b>DNS only</b> (grey cloud).</span></div>
     <div id="dom-list"></div>`;
   const list = $("#dom-list", body);
@@ -200,8 +220,17 @@ async function domains(body, ctx) {
       <button class="btn outline" data-check>${icon("shield")} Check DNS</button><button class="icon-btn sm" data-del title="Delete domain">${icon("delete")}</button></header>
       <div class="inner"><table class="tbl dns-tbl"><thead><tr><th>Type</th><th>Name / host</th><th>Value</th><th class="hide-sm">Purpose</th><th></th></tr></thead><tbody>
       ${d.dns.map((x) => `<tr><td><b>${esc(x.type)}</b></td><td>${esc(x.name)}</td><td>${esc(x.value)}</td><td class="hide-sm muted">${esc(x.purpose)}</td><td>${copyBtn(x.value)}</td></tr>`).join("")}
-      </tbody></table><div data-out></div></div></div>`);
+      </tbody></table>
+      ${r.mode === "bundled" ? `<div class="sts-row"><label><b>MTA-STS</b> (make other servers encrypt mail sent to you)
+        <select class="txt" data-sts style="max-width:140px;margin-left:8px">${["off", "testing", "enforce"].map((m) => `<option ${m === (d.mta_sts || "testing") ? "selected" : ""}>${m}</option>`).join("")}</select></label>
+        <span class="muted" style="font-size:12px">Start with <b>testing</b>. After a week of clean TLS reports to postmaster, switch to <b>enforce</b>. Update the <code>_mta-sts</code> TXT record after each change.</span></div>` : ""}
+      <div data-out></div></div></div>`);
     $("[data-check]", card).onclick = () => runDnsCheck($("[data-out]", card), d.name);
+    const sts = $("[data-sts]", card);
+    if (sts) sts.onchange = async () => {
+      try { await api("/api/admin/domains/mta-sts", { method: "POST", body: { name: d.name, mode: sts.value } }); snack(`MTA-STS for ${d.name}: ${sts.value}. Update the _mta-sts TXT record.`); reloadTab(ctx); }
+      catch (e) { snack(e.message); sts.value = d.mta_sts || "testing"; }
+    };
     $("[data-del]", card).onclick = () => modal({ title: `Delete ${d.name}?`, body: `<p>Mail for ${esc(d.name)} will no longer be accepted. Delete its accounts first.</p>`,
       buttons: [{ label: "Cancel" }, { label: "Delete domain", cls: "danger", onClick: async () => { try { await api("/api/admin/domains/delete", { method: "POST", body: { name: d.name } }); snack("Domain deleted"); reloadTab(ctx); } catch (e) { snack(e.message); return false; } } }] });
     list.append(card);
@@ -306,7 +335,7 @@ async function aliases(body, ctx) {
     buttons: [{ label: "Cancel" }, { label: "Save", cls: "primary", onClick: async (m) => { try { await api("/api/admin/aliases", { method: "POST", body: { source: $("#as", m).value, destinations: $("#ad", m).value } }); snack("Alias saved"); reloadTab(ctx); } catch (e) { snack(e.message); return false; } } }] });
   $("#al-new", body).onclick = () => form(null);
   $$("[data-edit]", body).forEach((b) => (b.onclick = () => form(r.aliases.find((x) => x.source === b.dataset.edit))));
-  $$("[data-del]", body).forEach((b) => (b.onclick = async () => { if (!confirm(`Delete alias ${b.dataset.del}?`)) return; await api("/api/admin/aliases/delete", { method: "POST", body: { source: b.dataset.del } }); snack("Alias deleted"); reloadTab(ctx); }));
+  $$("[data-del]", body).forEach((b) => (b.onclick = async () => { if (!(await Z.ask(`Delete alias ${b.dataset.del}?`, "Mail sent to this address will no longer be delivered.", "Delete", true))) return; await api("/api/admin/aliases/delete", { method: "POST", body: { source: b.dataset.del } }); snack("Alias deleted"); reloadTab(ctx); }));
 }
 
 // ------------------------------------------------------------------ import
@@ -442,7 +471,7 @@ async function migrate(body, ctx) {
       try { await api("/api/admin/migration/import", { method: "POST", body: { file: b.dataset.import, passphrase: $("#mg-ip", m).value } }); snack("Import started"); reloadTab(ctx); }
       catch (e) { snack(e.message); return false; } } }] })));
   $$("[data-delfile]", body).forEach((b) => (b.onclick = async () => {
-    if (!confirm(`Delete ${b.dataset.delfile}? Make sure you have a copy if you still need it.`)) return;
+    if (!(await Z.ask(`Delete ${b.dataset.delfile}?`, "Make sure you have a copy if you still need it.", "Delete", true))) return;
     try { await api("/api/admin/migration/delete", { method: "POST", body: { file: b.dataset.delfile } }); snack("Deleted"); reloadTab(ctx); } catch (e) { snack(e.message); }
   }));
   $$("[data-cancel]", body).forEach((b) => (b.onclick = async () => { await api("/api/admin/migration/cancel", { method: "POST", body: { id: b.dataset.cancel } }); reloadTab(ctx); }));
@@ -476,37 +505,132 @@ async function upgrade(body) {
 const LIC_STATE = {
   active: ["ok", "Active"], disabled: ["ok", "Not required"], missing: ["off", "No license key"],
   invalid: ["off", "Invalid key"], expired: ["off", "Expired"], inactive: ["warn", "Not activated"], lapsed: ["warn", "Activation lapsed"],
+  renewal_due: ["off", "Yearly renewal due"], suspended: ["off", "Suspended (payment overdue)"],
+  modified: ["off", "Locked (program files changed)"], grace: ["warn", "No key yet"],
 };
+function policiesRow(p) {
+  if (!p || !p.required) return "";
+  return `<tr><td>Policies</td><td>${p.accepted ? `<span class="badge ok">Version ${esc(p.version)} accepted</span>
+    <span class="muted" style="font-size:12px">by ${esc(p.accepted_by || "–")} on ${p.accepted_at ? new Date(p.accepted_at * 1000).toLocaleDateString() : "–"}</span>`
+    : `<span class="badge off">Version ${esc(p.version)} not accepted</span>`} <button class="btn text" data-policies>${p.accepted ? "View" : "Review and accept"}</button></td></tr>`;
+}
+// Code integrity: is this the official release, unchanged? Reported to Zoltis at every check-in.
+function integrityRow(i) {
+  if (!i) return "";
+  const lbl = { ok: ["ok", "Official release, unchanged"], modified: ["off", "Changed"], unsigned: ["warn", "Not an official signed build"] }[i.status] || ["", i.status];
+  const files = (i.files || []).slice(0, 10);
+  return `<tr><td>Program files</td><td><span class="badge ${lbl[0]}">${esc(lbl[1])}</span>
+    ${i.problem ? `<div class="muted" style="margin-top:6px;font-size:12px">${esc(i.problem)}${i.enforced ? "" : " · not enforced on this server"}</div>` : ""}
+    ${files.length ? `<div style="margin-top:6px;font-size:12px">${files.map((f) => `<code>${esc(f)}</code>`).join(" ")}${i.files.length > 10 ? " …" : ""}</div>` : ""}</td></tr>`;
+}
+const dayStr = (t) => (t ? new Date(t * 1000).toLocaleDateString() : "–");
+// Renewal / payment line for the License page and the warning banner.
+function billingRows(b) {
+  if (!b || !b.paid_until) return "";
+  const managed = b.plan === "managed";
+  return `<tr><td>Plan</td><td>${managed ? "Managed (monthly)" : "Community (free, renewed yearly)"}</td></tr>
+    <tr><td>${managed ? "Next payment due" : "Renew by"}</td><td>${dayStr(b.paid_until)}
+      ${managed && b.lock_at && b.status !== "ok" ? `<div class="st-warn" style="margin-top:6px">Service will be suspended on ${dayStr(b.lock_at)} if unpaid</div>` : ""}</td></tr>`;
+}
+function billingNote(lic) {
+  const b = lic?.billing;
+  if (!b) return "";
+  const box = (msg) => `<div class="limit-note" style="border:1px solid var(--danger, #d93025)">${icon("warning")}<span>${msg}</span></div>`;
+  if (b.status === "overdue")
+    return box(`<b>Payment overdue.</b> Pay your invoice before <b>${dayStr(b.lock_at)}</b>, or this mail service will be suspended and nobody can sign in until Zoltis restores it.`);
+  const where = `<a href="${esc(lic.register_url || "https://zoltismail.com/account/licenses")}" target="_blank" rel="noopener">zoltismail.com</a> (My account → License keys → Community Edition → Renew)`;
+  if (b.status === "renew_soon")
+    return box(`<b>Your license ends on ${dayStr(b.paid_until)}.</b> Renew it free on ${where}. Your key stays the same; this server picks up the new date at its next daily check.`);
+  if (b.status === "renewal_due")
+    return box(`<b>Your license has expired.</b> Mail keeps working, but you can't add accounts or domains until you renew it free on ${where}. Your key stays the same.`);
+  return "";
+}
+// ------------------------------------------------------------------ Community Edition policies
+function policiesNote(p) {
+  if (!p || !p.required || p.accepted) return "";
+  return `<div class="limit-note" style="border:1px solid var(--danger, #d93025)">${icon("warning")}<span><b>The Community Edition policies have changed (version ${esc(p.version)}).</b>
+    Creating email accounts and adding domains is paused until an administrator accepts them. Existing mailboxes keep working.
+    <button class="btn text" data-policies>Review and accept</button></span></div>`;
+}
+let policyOpen = false;
+async function policiesDialog(done) {
+  if (policyOpen) return;
+  let p;
+  try { p = await api("/api/admin/policies"); } catch (e) { snack(e.message); return; }
+  if (!p.required) return;
+  policyOpen = true;
+  const accepted = p.accepted;
+  modal({ title: `${p.title} · version ${p.version}`, wide: true, onClose: () => { policyOpen = false; }, body: `
+    <div class="policy-box" id="pol-text"><div class="loading-bar"></div></div>
+    ${accepted ? `<p class="muted" style="font-size:13px">Accepted by ${esc(p.accepted_by)} on ${new Date(p.accepted_at * 1000).toLocaleString()}.</p>`
+      : `<label class="policy-accept"><input type="checkbox" id="pol-ok"><span>I have read and accept the ${esc(p.title)} (version ${esc(p.version)})
+        and the <a href="${esc(p.terms_url)}" target="_blank" rel="noopener">Terms of Service</a> on behalf of the operator of this server.</span></label>`}`,
+    buttons: accepted ? [{ label: "Close" }] : [{ label: "Not now" }, { label: "Accept", cls: "primary", onClick: async (m) => {
+      if (!$("#pol-ok", m).checked) { snack("Tick the box to accept the policies"); return false; }
+      try { await api("/api/admin/policies/accept", { method: "POST", body: { version: p.version } }); snack("Policies accepted"); state.overview = null; done && done(); }
+      catch (e) { snack(e.message); return false; }
+    } }] });
+  Z.loadPolicies(p, document.getElementById("pol-text"));
+}
+window.addEventListener("zoltis:policies", () => policiesDialog(() => { if (location.hash.startsWith("#/admin")) dispatchEvent(new HashChangeEvent("hashchange")); }));
+document.addEventListener("click", (e) => { if (e.target.closest("[data-policies]")) policiesDialog(() => dispatchEvent(new HashChangeEvent("hashchange"))); });
+
+// How to get a key: shown on the License tab and in the reminders.
+function keySteps(L) {
+  return `<ol class="key-steps">
+    <li>Sign in at <a href="${esc(L.register_url)}" target="_blank" rel="noopener">zoltismail.com</a> (create a free account if you don't have one).</li>
+    <li>Open <b>My account → License keys → Community Edition</b>.</li>
+    <li>Enter this server's IP address: ${L.server_ip ? `<code>${esc(L.server_ip)}</code> ${copyBtn(L.server_ip)}` : "<b>the server's public IP</b> (set PUBLIC_IP in .env so it shows here)"}</li>
+    <li>Copy the key, paste it below and click <b>Activate</b>. It's checked with the Zoltis Mail licensing server and only works on this IP.</li></ol>`;
+}
+function graceNote(lic) {
+  if (!lic || lic.state !== "grace" || !lic.grace_until) return "";
+  const days = Math.max(0, Math.ceil((lic.grace_until * 1000 - Date.now()) / 86400000));
+  return `<div class="limit-note" style="border:1px solid #f4b400">${icon("warning")}<span><b>Add your free license key within ${days} day${days === 1 ? "" : "s"}</b> (by ${dayStr(lic.grace_until)}).
+    After that, creating email accounts and domains is paused until a key is added. <a href="#/admin/license">Add license key</a></span></div>`;
+}
 function licenseNote(lic) {
-  if (!lic || lic.active) return "";
+  if (lic && lic.state === "grace") return graceNote(lic);
+  if (lic && lic.active) return billingNote(lic);
+  if (!lic) return "";
   return `<div class="limit-note" style="border:1px solid var(--danger, #d93025)">${icon("warning")}<span><b>No active license.</b>
     Creating email accounts and adding domains is disabled until you activate a license key. Existing mailboxes keep working.
-    <a href="#/admin/license">Enter license key</a></span></div>`;
+    <a href="#/admin/license">Add license key</a></span></div>`;
 }
 async function license(body, ctx) {
   const L = await api("/api/admin/license");
   if (state.overview) state.overview.license = L;
   if (!L.required) {
-    body.innerHTML = `<div class="limit-note">${icon("check")}<span><b>No license key needed.</b>
-      Licensing is turned off on this server, so you can create accounts and add domains without a key.</span></div>`;
+    body.innerHTML = `${billingNote(L)}<div class="limit-note">${icon("check")}<span><b>No license key needed.</b>
+      Licensing is turned off on this server, so you can create accounts and add domains without a key.</span></div>
+      ${L.license_id ? `<table class="tbl" style="max-width:760px;margin-top:16px">
+        <tr><td style="width:200px">License ID</td><td><code>${esc(L.license_id)}</code></td></tr>
+        ${billingRows(L.billing)}
+        <tr><td>Last check-in</td><td>${L.last_check ? esc(ago(L.last_check)) : "–"} <span class="muted">· tells Zoltis this server is live, once a day</span></td></tr>
+        <tr><td>Install ID</td><td><code>${esc(L.install_id || "")}</code></td></tr></table>` : ""}
+      <table class="tbl" style="max-width:760px;margin-top:16px">${integrityRow(L.integrity)}${policiesRow(state.overview?.policies)}</table>`;
     return;
   }
   const [cls, label] = LIC_STATE[L.state] || ["", L.state];
   const day = (t) => (t ? new Date(t * 1000).toLocaleDateString() : "–");
-  body.innerHTML = `<table class="tbl" style="max-width:760px">
+  body.innerHTML = `${L.state === "grace" ? graceNote(L) : billingNote(L)}<table class="tbl" style="max-width:760px">
       <tr><td style="width:200px">Status</td><td><span class="badge ${cls}">${esc(label)}</span>${L.problem ? `<div class="st-warn" style="margin-top:6px">${esc(L.problem)}</div>` : ""}</td></tr>
       ${L.license_id ? `
       <tr><td>Licensed to</td><td><b>${esc(L.customer || "–")}</b> ${L.email ? `<span class="muted">${esc(L.email)}</span>` : ""}</td></tr>
       <tr><td>Domains covered</td><td>${L.domains.map((d) => `<code>${esc(d)}</code>`).join(" ")}</td></tr>
+      <tr><td>Server IP</td><td>${(L.ips || []).map((d) => `<code>${esc(d)}</code>`).join(" ")}${L.server_ip && L.ips?.length && !L.ips.includes(L.server_ip) ? ` <span class="st-fail">· this server is ${esc(L.server_ip)}</span>` : ""}</td></tr>
       <tr><td>License ID</td><td><code>${esc(L.license_id)}</code></td></tr>
       <tr><td>Key expires</td><td>${L.expires ? day(L.expires) : "Never"}</td></tr>
+      ${billingRows(L.billing)}
       <tr><td>Activation valid until</td><td>${day(L.activated_until)} <span class="muted">· renewed automatically every day</span></td></tr>
       <tr><td>Last checked</td><td>${L.last_check ? esc(ago(L.last_check)) : "–"} <button class="btn text" id="lic-check">Check now</button></td></tr>` : ""}
       <tr><td>Install ID</td><td><code>${esc(L.install_id || "")}</code> ${copyBtn(L.install_id || "")}</td></tr>
+      ${integrityRow(L.integrity)}${policiesRow(state.overview?.policies)}
     </table>
-    <h3 style="font:500 16px var(--font);margin:24px 0 8px">${L.license_id ? "Replace license key" : "Enter license key"}</h3>
-    <p class="muted" style="margin:0 0 12px;font-size:13px">Don't have a key? <a href="${esc(L.register_url)}" target="_blank" rel="noopener">Register for a free Community Edition key</a>.
-      The key is activated online once and checked again every day, so this server needs internet access.</p>
+    <h3 style="font:500 16px var(--font);margin:24px 0 8px">${L.license_id ? "Replace license key" : "Add your license key"}</h3>
+    ${L.license_id ? "" : keySteps(L)}
+    <p class="muted" style="margin:0 0 12px;font-size:13px">The key is valid for one year from activation and renewed free on zoltismail.com from 30 days before it ends.
+      It's checked with the licensing server every day, so this server needs internet access.</p>
     <textarea id="lic-key" class="lic-key" rows="4" spellcheck="false" placeholder="ZM1.…"></textarea>
     <div style="margin-top:12px"><button class="btn primary" id="lic-save">${icon("check")} Activate</button></div>`;
   $("#lic-save", body).onclick = async (e) => {
@@ -527,6 +651,11 @@ window.ZoltisModules = window.ZoltisModules || {};
 window.ZoltisModules.admin = async (root, ctx) => {
   if (!ctx.S.me.is_admin) { root.innerHTML = `<div class="empty">${icon("lock")}<p>Administrator access required.</p></div>`; return; }
   if (!state.overview) { try { const o = await api("/api/admin/overview"); state.overview = o; state.mode = o.mode; state.limits = o.limits; } catch (e) {} }
+  // Servers set up before the sign-in clocks existed: take the server time zone from this admin's device, once.
+  const st = state.overview?.server_time;
+  if (st && !st.configured) {
+    try { const r = await api("/api/admin/timezone", { method: "POST", body: { timezone: Z.browserTz() } }); state.overview.server_time = r; snack(`Server time zone set to ${r.timezone}. Change it in Overview.`); } catch (e) {}
+  }
   render(root, ctx);
 };
 })();
