@@ -619,3 +619,26 @@ pre.code { background: var(--surface-3); border-radius: 8px; padding: 10px 12px;
 [data-theme="dark"] .lic-banner.off { background: #3b2120; color: #f2b8b5; border-color: #5c2b29; }
 .lic-banner .ic { width: 18px; height: 18px; flex: none; }
 .lic-banner a { color: inherit; font-weight: 600; }
+
+/* ---------- Settings > Mobile: phone and tablet setup ---------- */
+.mob-head { display: flex; gap: 16px; align-items: flex-start; justify-content: space-between; margin-bottom: 12px; }
+.mob-qr { flex: none; display: flex; flex-direction: column; align-items: center; gap: 4px; font-size: 11px; color: var(--text-2); text-align: center; max-width: 120px; }
+.mob-qr .qr { width: 104px; height: 104px; border-radius: 6px; }
+.mob-apps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 4px 0 12px; }
+.mob-app { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 12px; background: none; color: var(--text); cursor: pointer; text-align: left; font: inherit; }
+.mob-app:hover { background: rgba(68,71,70,.06); }
+.mob-app.on { border-color: var(--primary); box-shadow: inset 0 0 0 1px var(--primary); background: rgba(11,87,208,.05); }
+.mob-app .ic { width: 22px; height: 22px; flex: none; color: var(--primary); }
+.mob-app b { display: block; font-weight: 500; font-size: 14px; }
+.mob-app small { display: block; color: var(--text-2); font-size: 12px; }
+.mob-steps { margin-bottom: 8px; }
+.mob-settings, .mob-help { margin: 8px 0; border: 1px solid var(--border); border-radius: 10px; padding: 8px 14px; }
+.mob-settings > summary, .mob-help > summary { cursor: pointer; font-weight: 500; font-size: 14px; padding: 4px 0; }
+.mob-settings .srv-table { margin-top: 6px; }
+.mob-help ul { margin: 6px 0 4px; padding-left: 18px; font-size: 13px; line-height: 1.55; }
+.mob-help li { margin: 4px 0; }
+@media (max-width: 600px) {
+  .mob-apps { grid-template-columns: 1fr; }
+  .mob-head { flex-direction: column; }
+}
+@media (max-width: 600px) { .modal .tabs { flex-wrap: wrap; overflow: visible; row-gap: 0; } .modal .tabs .tab { padding-left: 10px; padding-right: 10px; } }

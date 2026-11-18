@@ -15,7 +15,7 @@ on your own Ubuntu or Linux server.
 - **Admin console**: create and manage email accounts, domains, aliases and sessions, import mail from an old server, view the activity log
 - **Built-in mail server**: Postfix (SMTP) + Dovecot (IMAP) + OpenDKIM, with automatic HTTPS (Let's Encrypt)
 - **Security**: 2-step verification (authenticator app codes + recovery codes) with app passwords for mail apps, ClamAV antivirus, a risky-attachment blocker, tracking-image blocking, anti-spoofing, DKIM signing on every message
-- **Works with every mail app**: iPhone, Android, Outlook and Thunderbird over IMAP 993 and SMTP 587. *Settings → Mail apps*
+- **Works with every mail app**: IMAP 993 and SMTP 587. *Settings → Mobile* walks every user through Apple Mail (iPhone/iPad), Outlook (iPhone/Android) and Thunderbird (Android), with a QR code to open the guide on the phone; *Settings → Desktop apps* covers Mac Mail, Outlook and Thunderbird on computers
 - **Ready for the Zoltis Mail app**: sign-in with bearer tokens and a discovery URL (`/.well-known/zoltis-mail.json`). See [docs/MOBILE-APP.md](docs/MOBILE-APP.md)
   shows each user their exact settings with step-by-step guides, plus a one-tap setup profile for iPhone/iPad Mail
 

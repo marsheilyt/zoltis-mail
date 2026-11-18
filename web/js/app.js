@@ -446,6 +446,10 @@ function route() {
   const parts = location.hash.replace(/^#\/?/, "").split("/");
   let key = parts[0] || "inbox", rest = parts.slice(1);
   if (key === "module") return showModule(rest[0]);
+  if (key === "settings") {          // e.g. #/settings/mobile from the QR code on the Mobile tab
+    history.replaceState(null, "", "#/inbox"); route();
+    return openSettings(["general", "deliver", "security", "mobile", "apps", "about"].includes(rest[0]) ? rest[0] : "general");
+  }
   if (key === "admin") { $$(".folder").forEach((a) => a.classList.toggle("active", a.getAttribute("href") === "#/admin")); return showModule("admin", rest[0]); }
   let q = "";
   if (key === "f") { key = "f/" + rest[0]; rest = rest.slice(1); }
@@ -1538,16 +1542,17 @@ async function setupTwoFactor(done) {
   setTimeout(() => $("#tf-code", md.el).focus(), 50);
 }
 
-// ---------------------------------------------------------------- mail apps (iPhone, Outlook, Thunderbird)
-async function renderMailApps(tb) {
+// ---------------------------------------------------------------- mail apps: phones (Mobile tab) and computers (Desktop apps tab)
+const isPhone = () => /iPhone|iPad|iPod|Android/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+async function mailSetupInfo(tb) {
   tb.innerHTML = `<div class="loading-bar"></div>`;
-  let m;
-  try { m = await api("/api/account/mail-setup"); } catch (e) { tb.innerHTML = `<p class="st-fail">${esc(e.message)}</p>`; return; }
+  try { return await api("/api/account/mail-setup"); } catch (e) { tb.innerHTML = `<p class="st-fail">${esc(e.message)}</p>`; return null; }
+}
+function mailGuides(m) {
   const I = m.imap, O = m.smtp;
   const pwWord = m.twofa ? "your <b>app password</b> (not your normal password)" : "your email password";
   const v = (x) => `<code>${esc(x)}</code>`;
-  const smtpSec = `${O.port} · ${esc(O.security)}${O.alt_port ? ` <span class="muted">(or ${O.alt_port} · ${esc(O.alt_security)})</span>` : ""}`;
-  const apps = {
+  return {
     iphone: ["iPhone / iPad Mail", `
       ${m.profile ? `<p><b>Quickest:</b> open this page on your iPhone or iPad in <b>Safari</b> and tap the button. Then open the <b>Settings</b> app, tap <b>Profile Downloaded</b> → <b>Install</b>, and enter ${pwWord} when asked.</p>
       <p><a class="btn primary" href="/api/account/apple-profile">${icon("download")} Download iPhone / iPad setup profile</a></p>
@@ -1594,26 +1599,82 @@ async function renderMailApps(tb) {
         <li>Outgoing: server ${v(O.host)}, security ${esc(O.security)}, port ${O.port}, same username and password. Tap <b>Next</b> until done.</li>
       </ol>`],
   };
-  const guess = /iPhone|iPad/.test(navigator.userAgent) ? "iphone" : /Android/.test(navigator.userAgent) ? "outlookm" : /Macintosh/.test(navigator.userAgent) ? "mac" : "outlookd";
-  tb.innerHTML = `
-    ${m.twofa ? `<div class="callout">${icon("shield")}<div>2-step verification is on, so mail apps sign in with an <b>app password</b>, not your normal password.
+}
+function pwCallout(m) {
+  return m.twofa ? `<div class="callout">${icon("shield")}<div>2-step verification is on, so mail apps sign in with an <b>app password</b>, not your normal password.
       ${m.app_password ? "Use the app password you created (or create a new one if you don't have it)." : "You don't have one yet."}
-      <div style="margin-top:8px"><button class="btn outline" id="ma-app">${m.app_password ? "Create a new app password" : "Create app password"}</button></div></div></div>` : ""}
-    <div class="set-row"><b>Your settings</b><div><table class="srv-table">
+      <div style="margin-top:8px"><button class="btn outline" data-mkapp>${m.app_password ? "Create a new app password" : "Create app password"}</button></div></div></div>` : "";
+}
+function serverTable(m) {
+  const I = m.imap, O = m.smtp, v = (x) => `<code>${esc(x)}</code>`;
+  const pwWord = m.twofa ? "your <b>app password</b>" : "your email password";
+  return `<table class="srv-table">
       <tr><td>Email address</td><td>${v(m.email)} ${copyBtn(m.email)}</td></tr>
-      <tr><td>Username</td><td>${v(m.username)} <span class="muted">(full email address)</span></td></tr>
+      <tr><td>Username</td><td>${v(m.username)} ${copyBtn(m.username)} <span class="muted">(full email address)</span></td></tr>
       <tr><td>Password</td><td>${pwWord}</td></tr>
       <tr><td>Incoming (IMAP)</td><td>${v(I.host)} ${copyBtn(I.host)}<br><span class="muted">Port ${I.port} · ${esc(I.security)}</span></td></tr>
-      <tr><td>Outgoing (SMTP)</td><td>${v(O.host)} ${copyBtn(O.host)}<br><span class="muted">Port ${smtpSec} · password required</span></td></tr>
-    </table></div></div>
+      <tr><td>Outgoing (SMTP)</td><td>${v(O.host)} ${copyBtn(O.host)}<br><span class="muted">Port ${O.port} · ${esc(O.security)}${O.alt_port ? ` (or ${O.alt_port} · ${esc(O.alt_security)})` : ""} · password required</span></td></tr>
+    </table>`;
+}
+function wireAppPw(tb, again) { const ab = $("[data-mkapp]", tb); if (ab) ab.onclick = () => createAppPassword(again); }
+
+// Mobile tab: Apple Mail, Outlook and Thunderbird on phones and tablets, for every user.
+const MOBILE_APPS = [
+  ["iphone", "Apple Mail", "iPhone and iPad"],
+  ["outlookm", "Outlook", "iPhone and Android"],
+  ["tbirdm", "Thunderbird", "Android"],
+];
+async function renderMobileApps(tb, pick) {
+  const m = await mailSetupInfo(tb); if (!m) return;
+  const g = mailGuides(m), O = m.smtp;
+  const ua = navigator.userAgent, ios = /iPhone|iPad|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  let cur = pick || (ios ? "iphone" : /Android/.test(ua) ? "outlookm" : "iphone");
+  const link = `${location.origin}/#/settings/mobile`;
+  const notes = {
+    iphone: `<p class="muted" style="font-size:13px">Sent mail not showing in Sent? In <b>Settings → Apps → Mail → Mail Accounts</b> → your account → <b>Account</b> → <b>Advanced</b>, set <b>Sent Mailbox</b> to the server's <b>Sent</b> folder (and Drafts, Deleted and Archive the same way).</p>`,
+    outlookm: `<div class="callout">${icon("info")}<div>Outlook for iPhone and Android syncs IMAP accounts through Microsoft's cloud service, so your mail and password pass through Microsoft. If your organisation prefers mail to go only between your phone and this server, use Apple Mail or Thunderbird.</div></div>`,
+    tbirdm: `<p class="muted" style="font-size:13px">Thunderbird is free on Google Play and F-Droid. On iPhone, use Apple Mail or Outlook.</p>`,
+  };
+  const draw = () => {
+    tb.innerHTML = `
+      <div class="mob-head">
+        <div><b style="font-size:15px">Set up your phone or tablet</b>
+          <p class="muted" style="margin:4px 0 0;font-size:13px">Pick the app you use. Your mail, folders and sent messages stay in sync with this webmail.</p></div>
+        ${isPhone() ? "" : `<div class="mob-qr" title="Scan with your phone's camera">${qrSvg(link)}<span>Scan to open this guide on your phone</span></div>`}
+      </div>
+      <div class="mob-apps" role="tablist">${MOBILE_APPS.map(([k, name, where]) => `<button class="mob-app ${k === cur ? "on" : ""}" role="tab" aria-selected="${k === cur}" data-app="${k}">${icon("smartphone")}<span><b>${name}</b><small>${where}</small></span></button>`).join("")}</div>
+      ${pwCallout(m)}
+      <div class="mob-steps">${g[cur][1]}${notes[cur] || ""}</div>
+      <details class="mob-settings" ${cur === "iphone" && m.profile ? "" : "open"}><summary>Server settings to type in</summary>${serverTable(m)}</details>
+      <details class="mob-help"><summary>Something not working?</summary><ul>
+        <li><b>Password not accepted:</b> ${m.twofa ? "use your app password, not your normal password (create one above)." : "type your email password again; if you forgot it, change it in Settings → General or ask your administrator."} The username is always the full email address.</li>
+        <li><b>Can't connect to the server:</b> check the server name for typos. Some mobile networks block port ${O.port}: for outgoing mail use port ${O.alt_port || 465} with SSL/TLS instead.</li>
+        <li><b>Certificate or "cannot verify server identity" warning:</b> the server name must be exactly <code>${esc(m.imap.host)}</code>, not your domain or the webmail address.</li>
+        <li><b>Test it:</b> send an email from the phone to yourself. It should arrive here and show in Sent on both.</li>
+      </ul></details>`;
+    hydrateIcons(tb); wireCopy(tb); wireAppPw(tb, () => renderMobileApps(tb, cur));
+    $$(".mob-app", tb).forEach((btn) => (btn.onclick = () => { cur = btn.dataset.app; draw(); }));
+  };
+  draw();
+}
+
+// Desktop apps tab: Mac Mail, Outlook and Thunderbird on computers.
+async function renderMailApps(tb) {
+  const m = await mailSetupInfo(tb); if (!m) return;
+  const g = mailGuides(m), desk = ["mac", "outlookd", "tbird"];
+  const guess = /Macintosh/.test(navigator.userAgent) ? "mac" : "outlookd";
+  tb.innerHTML = `
+    <p class="muted" style="margin:0 0 8px;font-size:13px">Setting up a phone or tablet? Use the <a href="#" data-gomobile>Mobile</a> tab.</p>
+    ${pwCallout(m)}
+    <div class="set-row"><b>Your settings</b><div>${serverTable(m)}</div></div>
     <div class="set-row"><b>Step by step</b><div>
-      <select id="ma-pick" style="width:auto;margin-bottom:8px">${Object.entries(apps).map(([k, [l]]) => `<option value="${k}" ${k === guess ? "selected" : ""}>${esc(l)}</option>`).join("")}</select>
+      <select id="ma-pick" style="width:auto;margin-bottom:8px">${desk.map((k) => `<option value="${k}" ${k === guess ? "selected" : ""}>${esc(g[k][0])}</option>`).join("")}</select>
       <div id="ma-steps"></div>
     </div></div>`;
-  const show = () => { const st = $("#ma-steps", tb); st.innerHTML = apps[$("#ma-pick", tb).value][1]; hydrateIcons(st); };
+  const show = () => { const st = $("#ma-steps", tb); st.innerHTML = g[$("#ma-pick", tb).value][1]; hydrateIcons(st); };
   $("#ma-pick", tb).onchange = show; show();
-  wireCopy(tb);
-  const ab = $("#ma-app", tb); if (ab) ab.onclick = () => createAppPassword(() => renderMailApps(tb));
+  hydrateIcons(tb); wireCopy(tb); wireAppPw(tb, () => renderMailApps(tb));
+  $("[data-gomobile]", tb).onclick = (e) => { e.preventDefault(); const t = tb.parentElement && tb.parentElement.querySelector('.tab[data-t="mobile"]'); if (t) t.click(); };
 }
 
 // ---------------------------------------------------------------- settings
@@ -1624,7 +1685,8 @@ function openSettings(tab = "general") {
       <button class="tab" data-t="general">General</button>
       <button class="tab" data-t="deliver">Deliverability</button>
       <button class="tab" data-t="security">Security</button>
-      <button class="tab" data-t="apps">Mail apps</button>
+      <button class="tab" data-t="mobile">Mobile</button>
+      <button class="tab" data-t="apps">Desktop apps</button>
       <button class="tab" data-t="about">About</button>
     </div><div class="t-body"></div></div>`);
   const tb = $(".t-body", body);
@@ -1700,6 +1762,7 @@ function openSettings(tab = "general") {
       $("#set-logout", tb).onclick = logout;
       renderAccountSecurity($("#acct-sec", tb));
     },
+    mobile: () => renderMobileApps(tb),
     apps: () => renderMailApps(tb),
     about: () => {
       const ent = S.me.edition === "enterprise";
@@ -1711,7 +1774,11 @@ function openSettings(tab = "general") {
       $("#kb", tb).onclick = showShortcuts;
     },
   };
-  const go = (t) => { collect(); $$(".tab", body).forEach((x) => x.classList.toggle("on", x.dataset.t === t)); body.dataset.tab = t; tabs[t](); };
+  const go = (t) => {
+    collect(); $$(".tab", body).forEach((x) => x.classList.toggle("on", x.dataset.t === t)); body.dataset.tab = t; tabs[t]();
+    const on = $(`.tab[data-t="${t}"]`, body);
+    if (on && on.scrollIntoView) requestAnimationFrame(() => on.scrollIntoView({ block: "nearest", inline: "nearest" }));   // small screens: keep the open tab in view (after the window is shown)
+  };
   const collect = () => {
     if (body.dataset.tab !== "general") return;
     $$("[data-s]", tb).forEach((el) => { const k = el.dataset.s; s[k] = typeof S.settings[k] === "number" ? +el.value : el.value; });
@@ -1758,7 +1825,7 @@ async function logout() {
   location.hash = ""; location.reload();
 }
 $("#logout-btn").onclick = logout;
-$("#mailapps-link").onclick = () => { $("#account-menu").classList.add("hidden"); openSettings("apps"); };
+$("#mailapps-link").onclick = () => { $("#account-menu").classList.add("hidden"); openSettings(isPhone() ? "mobile" : "apps"); };
 $("#security-link").onclick = () => { $("#account-menu").classList.add("hidden"); openSettings("security"); };
 $("#menu-btn").onclick = () => { const a = $("#app"); if (innerWidth <= 900) a.classList.toggle("drawer"); else a.classList.toggle("collapsed"); };
 $("#scrim").onclick = () => $("#app").classList.remove("drawer");
